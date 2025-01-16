@@ -229,7 +229,7 @@ class Updater(FileConfiguration, CoreSysAttributes):
 
         # Parse data
         try:
-            data = data.replace('ghcr.io/', 'ghcr.nju.edu.cn/') # china
+            data = data.decode().replace('ghcr.io/', 'ghcr.nju.edu.cn/') # china
             data = json.loads(data)
         except json.JSONDecodeError as err:
             raise UpdaterError(
