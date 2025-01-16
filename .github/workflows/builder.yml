@@ -167,6 +167,7 @@ jobs:
             --${{ matrix.arch }} \
             --target /data \
             --cosign \
+            --docker-hub ghcr.io/${{ github.repository_owner }} \
             --generic ${{ needs.init.outputs.version }}
         env:
           CAS_API_KEY: ${{ secrets.CAS_TOKEN }}
