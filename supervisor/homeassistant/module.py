@@ -305,6 +305,9 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
 
         # Register for events
         self.sys_bus.register_event(BusEvent.HARDWARE_NEW_DEVICE, self._hardware_events)
+        self.sys_bus.register_event(
+            BusEvent.HARDWARE_REMOVE_DEVICE, self._hardware_events
+        )
 
     def write_pulse(self):
         """Write asound config to file and return True on success."""
@@ -413,11 +416,23 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                         if exclude_database:
                             excludes += HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE
 
+                        def is_excluded_by_filter(path: PurePath) -> bool:
+                            """Filter to filter excludes."""
+                            for exclude in excludes:
+                                if not path.match(exclude):
+                                    continue
+                                _LOGGER.debug(
+                                    "Ignoring %s because of %s", path, exclude
+                                )
+                                return True
+
+                            return False
+
                         # Backup data
                         atomic_contents_add(
                             backup,
                             self.sys_config.path_homeassistant,
-                            excludes=excludes,
+                            file_filter=is_excluded_by_filter,
                             arcname="data",
                         )
 
