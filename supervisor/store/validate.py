@@ -15,6 +15,7 @@ BUILTIN_REPOSITORIES = {
     URL_COMMUNITY_ADDONS,
     URL_ESPHOME,
     URL_MUSIC_ASSISTANT,
+    "https://gitee.com/hacs-china/addons",
 }
 
 # pylint: disable=no-value-for-parameter
