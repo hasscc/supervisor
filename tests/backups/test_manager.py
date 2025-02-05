@@ -25,6 +25,7 @@ from supervisor.docker.homeassistant import DockerHomeAssistant
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
     BackupError,
+    BackupFileNotFoundError,
     BackupInvalidError,
     BackupJobError,
     BackupMountDownError,
@@ -69,6 +70,28 @@ async def test_do_backup_full(coresys: CoreSys, backup_mock, install_addon_ssh):
 
     backup_instance.store_folders.assert_called_once()
     assert len(backup_instance.store_folders.call_args[0][0]) == 4
+
+    assert coresys.core.state == CoreState.RUNNING
+
+
+@pytest.mark.parametrize(
+    ("filename", "filename_expected"),
+    [("../my file.tar", "/data/backup/my file.tar"), (None, "/data/backup/{}.tar")],
+)
+async def test_do_backup_full_with_filename(
+    coresys: CoreSys, filename: str, filename_expected: str, backup_mock
+):
+    """Test creating Backup with a specific file name."""
+    coresys.core.state = CoreState.RUNNING
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    manager = BackupManager(coresys)
+
+    # backup_mock fixture causes Backup() to be a MagicMock
+    await manager.do_backup_full(filename=filename)
+
+    slug = backup_mock.call_args[0][2]
+    assert str(backup_mock.call_args[0][1]) == filename_expected.format(slug)
 
     assert coresys.core.state == CoreState.RUNNING
 
@@ -209,7 +232,6 @@ async def test_do_restore_full(coresys: CoreSys, full_backup_mock, install_addon
     manager = BackupManager(coresys)
 
     backup_instance = full_backup_mock.return_value
-    backup_instance.protected = False
     backup_instance.sys_addons = coresys.addons
     backup_instance.remove_delta_addons = partial(
         Backup.remove_delta_addons, backup_instance
@@ -242,7 +264,6 @@ async def test_do_restore_full_different_addon(
     manager = BackupManager(coresys)
 
     backup_instance = full_backup_mock.return_value
-    backup_instance.protected = False
     backup_instance.addon_list = ["differentslug"]
     backup_instance.sys_addons = coresys.addons
     backup_instance.remove_delta_addons = partial(
@@ -275,7 +296,6 @@ async def test_do_restore_partial_minimal(
     manager = BackupManager(coresys)
 
     backup_instance = partial_backup_mock.return_value
-    backup_instance.protected = False
     assert await manager.do_restore_partial(backup_instance, homeassistant=False)
 
     backup_instance.restore_homeassistant.assert_not_called()
@@ -300,7 +320,6 @@ async def test_do_restore_partial_maximal(coresys: CoreSys, partial_backup_mock)
     manager = BackupManager(coresys)
 
     backup_instance = partial_backup_mock.return_value
-    backup_instance.protected = False
     assert await manager.do_restore_partial(
         backup_instance,
         addons=[TEST_ADDON_SLUG],
@@ -333,13 +352,13 @@ async def test_fail_invalid_full_backup(
         await manager.do_restore_full(partial_backup_mock.return_value)
 
     backup_instance = full_backup_mock.return_value
-    backup_instance.protected = True
+    backup_instance.all_locations[None]["protected"] = True
     backup_instance.validate_password = AsyncMock(return_value=False)
 
     with pytest.raises(BackupInvalidError):
         await manager.do_restore_full(backup_instance)
 
-    backup_instance.protected = False
+    backup_instance.all_locations[None]["protected"] = False
     backup_instance.supervisor_version = "2022.08.4"
     with (
         patch.object(
@@ -362,13 +381,13 @@ async def test_fail_invalid_partial_backup(
     manager = BackupManager(coresys)
 
     backup_instance = partial_backup_mock.return_value
-    backup_instance.protected = True
+    backup_instance.all_locations[None]["protected"] = True
     backup_instance.validate_password = AsyncMock(return_value=False)
 
     with pytest.raises(BackupInvalidError):
         await manager.do_restore_partial(backup_instance)
 
-    backup_instance.protected = False
+    backup_instance.all_locations[None]["protected"] = False
     backup_instance.homeassistant = None
 
     with pytest.raises(BackupInvalidError):
@@ -1734,19 +1753,26 @@ async def test_backup_remove_error(
     healthy_expected: bool,
 ):
     """Test removing a backup error."""
-    copy(get_fixture_path("backup_example.tar"), coresys.config.path_backup)
-    await coresys.backups.reload(location=None, filename="backup_example.tar")
+    location: LOCATION_TYPE = backup_locations[0]
+    backup_base_path = coresys.backups._get_base_path(location)  # pylint: disable=protected-access
+    backup_base_path.mkdir(exist_ok=True)
+    copy(get_fixture_path("backup_example.tar"), backup_base_path)
+
+    await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
 
-    backup.all_locations[location_name] = (tar_mock := MagicMock())
-    tar_mock.unlink.side_effect = (err := OSError())
+    assert location_name in backup.all_locations
+    backup.all_locations[location_name]["path"] = (tar_file_mock := MagicMock())
+    tar_file_mock.unlink.side_effect = (err := OSError())
 
     err.errno = errno.EBUSY
-    assert coresys.backups.remove(backup) is False
+    with pytest.raises(BackupError):
+        coresys.backups.remove(backup)
     assert coresys.core.healthy is True
 
     err.errno = errno.EBADMSG
-    assert coresys.backups.remove(backup) is False
+    with pytest.raises(BackupError):
+        coresys.backups.remove(backup)
     assert coresys.core.healthy is healthy_expected
 
 
@@ -1962,7 +1988,7 @@ async def test_partial_reload_multiple_locations(
     assert backup.all_locations.keys() == {".cloud_backup"}
 
     copy(backup_file, tmp_supervisor_data / "backup")
-    await coresys.backups.reload(location=None, filename="backup_example.tar")
+    await coresys.backups.reload()
 
     assert coresys.backups.list_backups
     assert (backup := coresys.backups.get("7fed74c8"))
@@ -1971,7 +1997,7 @@ async def test_partial_reload_multiple_locations(
     assert backup.all_locations.keys() == {".cloud_backup", None}
 
     copy(backup_file, mount_dir)
-    await coresys.backups.reload(location=mount, filename="backup_example.tar")
+    await coresys.backups.reload()
 
     assert coresys.backups.list_backups
     assert (backup := coresys.backups.get("7fed74c8"))
@@ -1989,7 +2015,10 @@ async def test_backup_remove_multiple_locations(coresys: CoreSys):
 
     await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
-    assert backup.all_locations == {None: location_1, ".cloud_backup": location_2}
+    assert backup.all_locations == {
+        None: {"path": location_1, "protected": False},
+        ".cloud_backup": {"path": location_2, "protected": False},
+    }
 
     coresys.backups.remove(backup)
     assert not location_1.exists()
@@ -2006,13 +2035,16 @@ async def test_backup_remove_one_location_of_multiple(coresys: CoreSys):
 
     await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
-    assert backup.all_locations == {None: location_1, ".cloud_backup": location_2}
+    assert backup.all_locations == {
+        None: {"path": location_1, "protected": False},
+        ".cloud_backup": {"path": location_2, "protected": False},
+    }
 
     coresys.backups.remove(backup, locations=[".cloud_backup"])
     assert location_1.exists()
     assert not location_2.exists()
     assert coresys.backups.get("7fed74c8")
-    assert backup.all_locations == {None: location_1}
+    assert backup.all_locations == {None: {"path": location_1, "protected": False}}
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
@@ -2039,3 +2071,25 @@ async def test_addon_backup_excludes(coresys: CoreSys, install_addon_example: Ad
     assert not test2.exists()
     assert test_dir.is_dir()
     assert test3.exists()
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_remove_non_existing_backup_raises(
+    coresys: CoreSys,
+):
+    """Test removing a backup error."""
+    location: LOCATION_TYPE = None
+    backup_base_path = coresys.backups._get_base_path(location)  # pylint: disable=protected-access
+    backup_base_path.mkdir(exist_ok=True)
+    copy(get_fixture_path("backup_example.tar"), backup_base_path)
+
+    await coresys.backups.reload()
+    assert (backup := coresys.backups.get("7fed74c8"))
+
+    assert None in backup.all_locations
+    backup.all_locations[None]["path"] = (tar_file_mock := MagicMock())
+    tar_file_mock.unlink.side_effect = (err := FileNotFoundError())
+    err.errno = errno.ENOENT
+
+    with pytest.raises(BackupFileNotFoundError):
+        coresys.backups.remove(backup)

@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path, PurePath
 from shutil import copy
 from typing import Any
-from unittest.mock import ANY, AsyncMock, PropertyMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 from aiohttp import MultipartWriter
 from aiohttp.test_utils import TestClient
@@ -100,8 +100,13 @@ async def test_options(api_client: TestClient, coresys: CoreSys):
 
 
 @pytest.mark.parametrize(
-    "location,backup_dir",
-    [("backup_test", PurePath("mounts", "backup_test")), (None, PurePath("backup"))],
+    ("location", "backup_dir", "api_location"),
+    [
+        ("backup_test", PurePath("mounts", "backup_test"), "backup_test"),
+        (None, PurePath("backup"), None),
+        ("", PurePath("backup"), None),
+        (".local", PurePath("backup"), None),
+    ],
 )
 @pytest.mark.usefixtures("path_extern", "mount_propagation", "mock_is_mount")
 async def test_backup_to_location(
@@ -109,6 +114,7 @@ async def test_backup_to_location(
     coresys: CoreSys,
     location: str | None,
     backup_dir: PurePath,
+    api_location: str | None,
     tmp_supervisor_data: Path,
 ):
     """Test making a backup to a specific location with default mount."""
@@ -145,7 +151,7 @@ async def test_backup_to_location(
     resp = await api_client.get(f"/backups/{slug}/info")
     result = await resp.json()
     assert result["result"] == "ok"
-    assert result["data"]["location"] == location
+    assert result["data"]["location"] == api_location
 
 
 @pytest.mark.usefixtures(
@@ -479,7 +485,9 @@ async def test_restore_immediate_errors(
     assert "Must update supervisor" in (await resp.json())["message"]
 
     with (
-        patch.object(Backup, "protected", new=PropertyMock(return_value=True)),
+        patch.object(
+            Backup, "all_locations", new={None: {"path": None, "protected": True}}
+        ),
         patch.object(Backup, "validate_password", return_value=False),
     ):
         resp = await api_client.post(
@@ -496,6 +504,13 @@ async def test_restore_immediate_errors(
         )
     assert resp.status == 400
     assert "No Home Assistant" in (await resp.json())["message"]
+
+    resp = await api_client.post(
+        f"/backups/{mock_partial_backup.slug}/restore/partial",
+        json={"background": True, "folders": ["ssl"]},
+    )
+    assert resp.status == 404
+    assert "file does not exist" in (await resp.json())["message"]
 
 
 @pytest.mark.parametrize(
@@ -544,7 +559,7 @@ async def test_cloud_backup_core_only(api_client: TestClient, mock_full_backup: 
     assert resp.status == 403
 
     # pylint: disable-next=protected-access
-    mock_full_backup._locations = {".cloud_backup": None}
+    mock_full_backup._locations = {".cloud_backup": {"path": None, "protected": False}}
     assert mock_full_backup.location == ".cloud_backup"
 
     resp = await api_client.post(f"/backups/{mock_full_backup.slug}/restore/full")
@@ -623,8 +638,8 @@ async def test_backup_to_multiple_locations(
     assert orig_backup.exists()
     assert copy_backup.exists()
     assert coresys.backups.get(slug).all_locations == {
-        None: orig_backup,
-        ".cloud_backup": copy_backup,
+        None: {"path": orig_backup, "protected": False},
+        ".cloud_backup": {"path": copy_backup, "protected": False},
     }
     assert coresys.backups.get(slug).location is None
 
@@ -661,14 +676,18 @@ async def test_backup_with_extras(
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_upload_to_multiple_locations(api_client: TestClient, coresys: CoreSys):
+@pytest.mark.parametrize("local_location", ["", ".local"])
+async def test_upload_to_multiple_locations(
+    api_client: TestClient, coresys: CoreSys, local_location: str
+):
     """Test uploading a backup to multiple locations."""
     backup_file = get_fixture_path("backup_example.tar")
 
     with backup_file.open("rb") as file, MultipartWriter("form-data") as mp:
         mp.append(file)
         resp = await api_client.post(
-            "/backups/new/upload?location=&location=.cloud_backup", data=mp
+            f"/backups/new/upload?location={local_location}&location=.cloud_backup",
+            data=mp,
         )
 
     assert resp.status == 200
@@ -680,8 +699,8 @@ async def test_upload_to_multiple_locations(api_client: TestClient, coresys: Cor
     assert orig_backup.exists()
     assert copy_backup.exists()
     assert coresys.backups.get("7fed74c8").all_locations == {
-        None: orig_backup,
-        ".cloud_backup": copy_backup,
+        None: {"path": orig_backup, "protected": False},
+        ".cloud_backup": {"path": copy_backup, "protected": False},
     }
     assert coresys.backups.get("7fed74c8").location is None
 
@@ -693,8 +712,10 @@ async def test_upload_duplicate_backup_new_location(
     """Test uploading a backup that already exists to a new location."""
     backup_file = get_fixture_path("backup_example.tar")
     orig_backup = Path(copy(backup_file, coresys.config.path_backup))
-    await coresys.backups.reload(None, "backup_example.tar")
-    assert coresys.backups.get("7fed74c8").all_locations == {None: orig_backup}
+    await coresys.backups.reload()
+    assert coresys.backups.get("7fed74c8").all_locations == {
+        None: {"path": orig_backup, "protected": False}
+    }
 
     with backup_file.open("rb") as file, MultipartWriter("form-data") as mp:
         mp.append(file)
@@ -710,8 +731,45 @@ async def test_upload_duplicate_backup_new_location(
     assert orig_backup.exists()
     assert copy_backup.exists()
     assert coresys.backups.get("7fed74c8").all_locations == {
-        None: orig_backup,
-        ".cloud_backup": copy_backup,
+        None: {"path": orig_backup, "protected": False},
+        ".cloud_backup": {"path": copy_backup, "protected": False},
+    }
+    assert coresys.backups.get("7fed74c8").location is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_status"),
+    [("good.tar", 200), ("../bad.tar", 400), ("bad", 400)],
+)
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_upload_with_filename(
+    api_client: TestClient, coresys: CoreSys, filename: str, expected_status: int
+):
+    """Test uploading a backup to multiple locations."""
+    backup_file = get_fixture_path("backup_example.tar")
+
+    with backup_file.open("rb") as file, MultipartWriter("form-data") as mp:
+        mp.append(file)
+        resp = await api_client.post(
+            f"/backups/new/upload?filename={filename}", data=mp
+        )
+
+    assert resp.status == expected_status
+    body = await resp.json()
+    if expected_status != 200:
+        assert (
+            body["message"]
+            == r"does not match regular expression ^[^\\\/]+\.tar$."
+            + f" Got '{filename}'"
+        )
+        return
+
+    assert body["data"]["slug"] == "7fed74c8"
+
+    orig_backup = coresys.config.path_backup / filename
+    assert orig_backup.exists()
+    assert coresys.backups.get("7fed74c8").all_locations == {
+        None: {"path": orig_backup, "protected": False}
     }
     assert coresys.backups.get("7fed74c8").location is None
 
@@ -743,7 +801,10 @@ async def test_remove_backup_from_location(api_client: TestClient, coresys: Core
 
     await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
-    assert backup.all_locations == {None: location_1, ".cloud_backup": location_2}
+    assert backup.all_locations == {
+        None: {"path": location_1, "protected": False},
+        ".cloud_backup": {"path": location_2, "protected": False},
+    }
 
     resp = await api_client.delete(
         "/backups/7fed74c8", json={"location": ".cloud_backup"}
@@ -753,11 +814,37 @@ async def test_remove_backup_from_location(api_client: TestClient, coresys: Core
     assert location_1.exists()
     assert not location_2.exists()
     assert coresys.backups.get("7fed74c8")
-    assert backup.all_locations == {None: location_1}
+    assert backup.all_locations == {None: {"path": location_1, "protected": False}}
 
 
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_remove_backup_file_not_found(api_client: TestClient, coresys: CoreSys):
+    """Test removing a backup from one location of multiple."""
+    backup_file = get_fixture_path("backup_example.tar")
+    location = Path(copy(backup_file, coresys.config.path_backup))
+
+    await coresys.backups.reload()
+    assert (backup := coresys.backups.get("7fed74c8"))
+    assert backup.all_locations == {
+        None: {"path": location, "protected": False},
+    }
+
+    location.unlink()
+    resp = await api_client.delete("/backups/7fed74c8")
+    assert resp.status == 404
+    body = await resp.json()
+    assert (
+        body["message"]
+        == f"Cannot delete backup at {str(location)}, file does not exist!"
+    )
+
+
+@pytest.mark.parametrize("local_location", ["", ".local"])
 async def test_download_backup_from_location(
-    api_client: TestClient, coresys: CoreSys, tmp_supervisor_data: Path
+    api_client: TestClient,
+    coresys: CoreSys,
+    tmp_supervisor_data: Path,
+    local_location: str,
 ):
     """Test downloading a backup from a specific location."""
     backup_file = get_fixture_path("backup_example.tar")
@@ -766,17 +853,20 @@ async def test_download_backup_from_location(
 
     await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
-    assert backup.all_locations == {None: location_1, ".cloud_backup": location_2}
+    assert backup.all_locations == {
+        None: {"path": location_1, "protected": False},
+        ".cloud_backup": {"path": location_2, "protected": False},
+    }
 
     # The use case of this is user might want to pick a particular mount if one is flaky
     # To simulate this, remove the file from one location and show one works and the other doesn't
     assert backup.location is None
-    location_1.unlink()
-
-    resp = await api_client.get("/backups/7fed74c8/download?location=")
-    assert resp.status == 404
+    location_2.unlink()
 
     resp = await api_client.get("/backups/7fed74c8/download?location=.cloud_backup")
+    assert resp.status == 404
+
+    resp = await api_client.get(f"/backups/7fed74c8/download?location={local_location}")
     assert resp.status == 200
     out_file = tmp_supervisor_data / "backup_example.tar"
     with out_file.open("wb") as out:
@@ -814,8 +904,12 @@ async def test_partial_backup_all_addons(
         store_addons.assert_called_once_with([install_addon_ssh])
 
 
+@pytest.mark.parametrize("local_location", [None, "", ".local"])
 async def test_restore_backup_from_location(
-    api_client: TestClient, coresys: CoreSys, tmp_supervisor_data: Path
+    api_client: TestClient,
+    coresys: CoreSys,
+    tmp_supervisor_data: Path,
+    local_location: str | None,
 ):
     """Test restoring a backup from a specific location."""
     coresys.core.state = CoreState.RUNNING
@@ -839,18 +933,18 @@ async def test_restore_backup_from_location(
     # The use case of this is user might want to pick a particular mount if one is flaky
     # To simulate this, remove the file from one location and show one works and the other doesn't
     assert backup.location is None
-    backup.all_locations[None].unlink()
+    (backup_local_path := backup.all_locations[None]["path"]).unlink()
     test_file.unlink()
 
     resp = await api_client.post(
         f"/backups/{backup.slug}/restore/partial",
-        json={"location": None, "folders": ["share"]},
+        json={"location": local_location, "folders": ["share"]},
     )
-    assert resp.status == 400
+    assert resp.status == 404
     body = await resp.json()
     assert (
         body["message"]
-        == f"Cannot open backup at {backup.all_locations[None].as_posix()}, file does not exist!"
+        == f"Cannot open backup at {backup_local_path.as_posix()}, file does not exist!"
     )
 
     resp = await api_client.post(
@@ -859,6 +953,68 @@ async def test_restore_backup_from_location(
     )
     assert resp.status == 200
     assert test_file.is_file()
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_restore_backup_unencrypted_after_encrypted(
+    api_client: TestClient,
+    coresys: CoreSys,
+):
+    """Test restoring an unencrypted backup after an encrypted backup and vis-versa."""
+    enc_tar = copy(get_fixture_path("test_consolidate.tar"), coresys.config.path_backup)
+    unc_tar = copy(
+        get_fixture_path("test_consolidate_unc.tar"), coresys.config.path_core_backup
+    )
+    await coresys.backups.reload()
+
+    backup = coresys.backups.get("d9c48f8b")
+    assert backup.all_locations == {
+        None: {"path": Path(enc_tar), "protected": True},
+        ".cloud_backup": {"path": Path(unc_tar), "protected": False},
+    }
+
+    # pylint: disable=fixme
+    # TODO: There is a bug in the restore code that causes the restore to fail
+    # if the backup contains a Docker registry configuration and one location
+    # is encrypted and the other is not (just like our test fixture).
+    # We punt the ball on this one for this PR since this is a rare edge case.
+    backup.restore_dockerconfig = MagicMock()
+
+    coresys.core.state = CoreState.RUNNING
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    # Restore encrypted backup
+    (test_file := coresys.config.path_ssl / "test.txt").touch()
+    resp = await api_client.post(
+        f"/backups/{backup.slug}/restore/partial",
+        json={"location": None, "password": "test", "folders": ["ssl"]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["result"] == "ok"
+    assert not test_file.is_file()
+
+    # Restore unencrypted backup
+    test_file.touch()
+    resp = await api_client.post(
+        f"/backups/{backup.slug}/restore/partial",
+        json={"location": ".cloud_backup", "folders": ["ssl"]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["result"] == "ok"
+    assert not test_file.is_file()
+
+    # Restore encrypted backup
+    test_file.touch()
+    resp = await api_client.post(
+        f"/backups/{backup.slug}/restore/partial",
+        json={"location": None, "password": "test", "folders": ["ssl"]},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["result"] == "ok"
+    assert not test_file.is_file()
 
 
 @pytest.mark.parametrize(
@@ -914,3 +1070,233 @@ async def test_restore_homeassistant_adds_env(
         ]
         == job.uuid
     )
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_backup_mixed_encryption(api_client: TestClient, coresys: CoreSys):
+    """Test a backup with mixed encryption status across locations."""
+    enc_tar = copy(get_fixture_path("test_consolidate.tar"), coresys.config.path_backup)
+    unc_tar = copy(
+        get_fixture_path("test_consolidate_unc.tar"), coresys.config.path_core_backup
+    )
+    await coresys.backups.reload()
+
+    backup = coresys.backups.get("d9c48f8b")
+    assert backup.all_locations == {
+        None: {"path": Path(enc_tar), "protected": True},
+        ".cloud_backup": {"path": Path(unc_tar), "protected": False},
+    }
+
+    resp = await api_client.get("/backups")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["data"]["backups"][0]["slug"] == "d9c48f8b"
+    assert body["data"]["backups"][0]["location"] is None
+    assert body["data"]["backups"][0]["locations"] == [None]
+    assert body["data"]["backups"][0]["protected"] is True
+    assert body["data"]["backups"][0]["location_attributes"] == {
+        ".local": {
+            "protected": True,
+            "size_bytes": 10240,
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("backup_type", "options"), [("full", {}), ("partial", {"folders": ["ssl"]})]
+)
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_protected_backup(
+    api_client: TestClient, coresys: CoreSys, backup_type: str, options: dict[str, Any]
+):
+    """Test creating a protected backup."""
+    coresys.core.state = CoreState.RUNNING
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    resp = await api_client.post(
+        f"/backups/new/{backup_type}",
+        json={"name": "test", "password": "test"} | options,
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert (slug := body["data"]["slug"])
+
+    resp = await api_client.get("/backups")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["data"]["backups"][0]["slug"] == slug
+    assert body["data"]["backups"][0]["location"] is None
+    assert body["data"]["backups"][0]["locations"] == [None]
+    assert body["data"]["backups"][0]["protected"] is True
+    assert (
+        body["data"]["backups"][0]["location_attributes"][".local"]["protected"] is True
+    )
+    # NOTE: It is not safe to check size exactly here, as order of keys in
+    # `homeassistant.json` and potentially other random data (e.g. isntance UUID,
+    # backup slug) does change the size of the backup (due to gzip).
+    assert body["data"]["backups"][0]["location_attributes"][".local"]["size_bytes"] > 0
+
+    resp = await api_client.get(f"/backups/{slug}/info")
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["data"]["location"] is None
+    assert body["data"]["locations"] == [None]
+    assert body["data"]["protected"] is True
+    assert body["data"]["location_attributes"][".local"]["protected"] is True
+    assert body["data"]["location_attributes"][".local"]["size_bytes"] > 0
+
+
+@pytest.mark.usefixtures(
+    "path_extern", "mount_propagation", "mock_is_mount", "tmp_supervisor_data"
+)
+async def test_upload_to_mount(api_client: TestClient, coresys: CoreSys):
+    """Test uploading a backup to a specific mount."""
+    await coresys.mounts.load()
+    (coresys.config.path_mounts / "backup_test").mkdir()
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "backup_test",
+            "type": "cifs",
+            "usage": "backup",
+            "server": "backup.local",
+            "share": "backups",
+        },
+    )
+    await coresys.mounts.create_mount(mount)
+
+    # Capture our backup initially
+    backup_file = get_fixture_path("backup_example.tar")
+    backup = Backup(coresys, backup_file, "in", None)
+    await backup.load()
+
+    # Upload it and confirm it matches what we had
+    with backup_file.open("rb") as file, MultipartWriter("form-data") as mp:
+        mp.append(file)
+        resp = await api_client.post(
+            "/backups/new/upload?location=backup_test", data=mp
+        )
+
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["data"]["slug"] == "7fed74c8"
+    assert backup == coresys.backups.get("7fed74c8")
+
+
+@pytest.mark.parametrize(
+    ("method", "url_path", "body", "backup_file"),
+    [
+        (
+            "delete",
+            "/backups/7fed74c8",
+            {"location": ".cloud_backup"},
+            "backup_example.tar",
+        ),
+        (
+            "post",
+            "/backups/7fed74c8/restore/partial",
+            {"location": ".cloud_backup", "folders": ["ssl"]},
+            "backup_example.tar",
+        ),
+        (
+            "get",
+            "/backups/7fed74c8/download?location=.cloud_backup",
+            None,
+            "backup_example.tar",
+        ),
+        (
+            "post",
+            "/backups/93b462f8/restore/partial",
+            {"location": ".cloud_backup", "folders": ["ssl"], "password": "bad"},
+            "backup_example_enc.tar",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_missing_file_removes_location_from_cache(
+    api_client: TestClient,
+    coresys: CoreSys,
+    method: str,
+    url_path: str,
+    body: dict[str, Any] | None,
+    backup_file: str,
+):
+    """Test finding a missing file removes the location from cache."""
+    coresys.core.state = CoreState.RUNNING
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    backup_file = get_fixture_path(backup_file)
+    copy(backup_file, coresys.config.path_backup)
+    bad_location = Path(copy(backup_file, coresys.config.path_core_backup))
+    await coresys.backups.reload()
+    assert len(coresys.backups.list_backups) == 1
+    slug = list(coresys.backups.list_backups)[0].slug
+
+    # After reload, remove one of the file and confirm we have an out of date cache
+    bad_location.unlink()
+    assert coresys.backups.get(slug).all_locations.keys() == {
+        None,
+        ".cloud_backup",
+    }
+
+    resp = await api_client.request(method, url_path, json=body)
+    assert resp.status == 404
+
+    # Wait for reload task to complete and confirm location is removed
+    await asyncio.sleep(0)
+    assert coresys.backups.get(slug).all_locations.keys() == {None}
+
+
+@pytest.mark.parametrize(
+    ("method", "url_path", "body", "backup_file"),
+    [
+        ("delete", "/backups/7fed74c8", {"location": ".local"}, "backup_example.tar"),
+        (
+            "post",
+            "/backups/7fed74c8/restore/partial",
+            {"location": ".local", "folders": ["ssl"]},
+            "backup_example.tar",
+        ),
+        (
+            "get",
+            "/backups/7fed74c8/download?location=.local",
+            None,
+            "backup_example.tar",
+        ),
+        (
+            "post",
+            "/backups/93b462f8/restore/partial",
+            {"location": ".local", "folders": ["ssl"], "password": "bad"},
+            "backup_example_enc.tar",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_missing_file_removes_backup_from_cache(
+    api_client: TestClient,
+    coresys: CoreSys,
+    method: str,
+    url_path: str,
+    body: dict[str, Any] | None,
+    backup_file: str,
+):
+    """Test finding a missing file removes the backup from cache if its the only one."""
+    coresys.core.state = CoreState.RUNNING
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    backup_file = get_fixture_path(backup_file)
+    bad_location = Path(copy(backup_file, coresys.config.path_backup))
+    await coresys.backups.reload()
+    assert len(coresys.backups.list_backups) == 1
+    slug = list(coresys.backups.list_backups)[0].slug
+
+    # After reload, remove one of the file and confirm we have an out of date cache
+    bad_location.unlink()
+    assert coresys.backups.get(slug).all_locations.keys() == {None}
+
+    resp = await api_client.request(method, url_path, json=body)
+    assert resp.status == 404
+
+    # Wait for reload task to complete and confirm backup is removed
+    await asyncio.sleep(0)
+    assert not coresys.backups.list_backups
