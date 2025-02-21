@@ -1,13 +1,12 @@
 """Representation of a backup file."""
 
 import asyncio
-from base64 import b64decode, b64encode
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Awaitable
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import timedelta
-from functools import cached_property
+from functools import lru_cache
 import io
 import json
 import logging
@@ -20,7 +19,6 @@ from typing import Any, Self
 
 from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from securetar import SecureTarFile, atomic_contents_add, secure_path
 import voluptuous as vol
@@ -38,20 +36,23 @@ from ..const import (
     ATTR_FOLDERS,
     ATTR_HOMEASSISTANT,
     ATTR_NAME,
-    ATTR_PASSWORD,
+    ATTR_PATH,
     ATTR_PROTECTED,
-    ATTR_REGISTRIES,
     ATTR_REPOSITORIES,
     ATTR_SIZE,
     ATTR_SLUG,
     ATTR_SUPERVISOR_VERSION,
     ATTR_TYPE,
-    ATTR_USERNAME,
     ATTR_VERSION,
     CRYPTO_AES128,
 )
 from ..coresys import CoreSys
-from ..exceptions import AddonsError, BackupError, BackupInvalidError
+from ..exceptions import (
+    AddonsError,
+    BackupError,
+    BackupFileNotFoundError,
+    BackupInvalidError,
+)
 from ..jobs.const import JOB_GROUP_BACKUP
 from ..jobs.decorator import Job
 from ..jobs.job_group import JobGroup
@@ -64,6 +65,12 @@ from .utils import key_to_iv, password_to_key
 from .validate import SCHEMA_BACKUP
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+@lru_cache
+def _backup_file_size(backup: Path) -> int:
+    """Get backup file size."""
+    return backup.stat().st_size if backup.is_file() else 0
 
 
 def location_sort_key(value: str | None) -> str:
@@ -91,7 +98,12 @@ class Backup(JobGroup):
         self._outer_secure_tarfile: SecureTarFile | None = None
         self._key: bytes | None = None
         self._aes: Cipher | None = None
-        self._locations: dict[str | None, Path] = {location: tar_file}
+        self._locations: dict[str | None, dict[str, Path | bool]] = {
+            location: {
+                ATTR_PATH: tar_file,
+                ATTR_PROTECTED: data.get(ATTR_PROTECTED, False) if data else False,
+            }
+        }
 
     @property
     def version(self) -> int:
@@ -121,7 +133,7 @@ class Backup(JobGroup):
     @property
     def protected(self) -> bool:
         """Return backup date."""
-        return self._data[ATTR_PROTECTED]
+        return self._locations[self.location][ATTR_PROTECTED]
 
     @property
     def compressed(self) -> bool:
@@ -145,12 +157,12 @@ class Backup(JobGroup):
 
     @property
     def repositories(self) -> list[str]:
-        """Return backup date."""
+        """Return add-on store repositories."""
         return self._data[ATTR_REPOSITORIES]
 
     @repositories.setter
     def repositories(self, value: list[str]) -> None:
-        """Set backup date."""
+        """Set add-on store repositories."""
         self._data[ATTR_REPOSITORIES] = value
 
     @property
@@ -198,7 +210,7 @@ class Backup(JobGroup):
         return self.locations[0]
 
     @property
-    def all_locations(self) -> dict[str | None, Path]:
+    def all_locations(self) -> dict[str | None, dict[str, Path | bool]]:
         """Return all locations this backup was found in."""
         return self._locations
 
@@ -216,17 +228,15 @@ class Backup(JobGroup):
             key=location_sort_key,
         )
 
-    @cached_property
+    @property
     def size(self) -> float:
         """Return backup size."""
         return round(self.size_bytes / 1048576, 2)  # calc mbyte
 
-    @cached_property
+    @property
     def size_bytes(self) -> int:
         """Return backup size in bytes."""
-        if not self.tarfile.is_file():
-            return 0
-        return self.tarfile.stat().st_size
+        return self.location_size(self.location)
 
     @property
     def is_new(self) -> bool:
@@ -236,7 +246,7 @@ class Backup(JobGroup):
     @property
     def tarfile(self) -> Path:
         """Return path to backup tarfile."""
-        return self._locations[self.location]
+        return self._locations[self.location][ATTR_PATH]
 
     @property
     def is_current(self) -> bool:
@@ -250,9 +260,37 @@ class Backup(JobGroup):
         """Returns a copy of the data."""
         return deepcopy(self._data)
 
+    def location_size(self, location: str | None) -> int:
+        """Get size of backup in a location."""
+        if location not in self.all_locations:
+            return 0
+
+        backup = self.all_locations[location][ATTR_PATH]
+        return _backup_file_size(backup)
+
     def __eq__(self, other: Any) -> bool:
         """Return true if backups have same metadata."""
-        return isinstance(other, Backup) and self._data == other._data
+        if not isinstance(other, Backup):
+            return False
+
+        # Compare all fields except ones about protection. Current encryption status does not affect equality
+        keys = self._data.keys() | other._data.keys()
+        for k in keys - {ATTR_PROTECTED, ATTR_CRYPTO, ATTR_DOCKER}:
+            if (
+                k not in self._data
+                or k not in other._data
+                or self._data[k] != other._data[k]
+            ):
+                _LOGGER.info(
+                    "Backup %s and %s not equal because %s field has different value: %s and %s",
+                    self.slug,
+                    other.slug,
+                    k,
+                    self._data.get(k),
+                    other._data.get(k),
+                )
+                return False
+        return True
 
     def consolidate(self, backup: Self) -> None:
         """Consolidate two backups with same slug in different locations."""
@@ -263,6 +301,20 @@ class Backup(JobGroup):
         if self != backup:
             raise BackupInvalidError(
                 f"Backup in {backup.location} and {self.location} both have slug {self.slug} but are not the same!"
+            )
+
+        # In case of conflict we always ignore the ones from the first one. But log them to let the user know
+
+        if conflict := {
+            loc: val[ATTR_PATH]
+            for loc, val in self.all_locations.items()
+            if loc in backup.all_locations and backup.all_locations[loc] != val
+        }:
+            _LOGGER.warning(
+                "Backup %s exists in two files in locations %s. Ignoring %s",
+                self.slug,
+                ", ".join(str(loc) for loc in conflict),
+                ", ".join([path.as_posix() for path in conflict.values()]),
             )
         self._locations.update(backup.all_locations)
 
@@ -292,6 +344,7 @@ class Backup(JobGroup):
             self._init_password(password)
             self._data[ATTR_PROTECTED] = True
             self._data[ATTR_CRYPTO] = CRYPTO_AES128
+            self._locations[self.location][ATTR_PROTECTED] = True
 
         if not compressed:
             self._data[ATTR_COMPRESSED] = False
@@ -313,38 +366,17 @@ class Backup(JobGroup):
             backend=default_backend(),
         )
 
-    def _encrypt_data(self, data: str) -> str:
-        """Make data secure."""
-        if not self._key or data is None:
-            return data
-
-        encrypt = self._aes.encryptor()
-        padder = padding.PKCS7(128).padder()
-
-        data = padder.update(data.encode()) + padder.finalize()
-        return b64encode(encrypt.update(data)).decode()
-
-    def _decrypt_data(self, data: str) -> str:
-        """Make data readable."""
-        if not self._key or data is None:
-            return data
-
-        decrypt = self._aes.decryptor()
-        padder = padding.PKCS7(128).unpadder()
-
-        data = padder.update(decrypt.update(b64decode(data))) + padder.finalize()
-        return data.decode()
-
-    async def validate_password(self) -> bool:
+    async def validate_password(self, location: str | None) -> bool:
         """Validate backup password.
 
         Returns false only when the password is known to be wrong.
         """
+        backup_file: Path = self.all_locations[location][ATTR_PATH]
 
         def _validate_file() -> bool:
             ending = f".tar{'.gz' if self.compressed else ''}"
 
-            with tarfile.open(self.tarfile, "r:") as backup:
+            with tarfile.open(backup_file, "r:") as backup:
                 test_tar_name = next(
                     (
                         entry.name
@@ -375,7 +407,14 @@ class Backup(JobGroup):
                     _LOGGER.exception("Unexpected error validating password")
                     return True
 
-        return await self.sys_run_in_executor(_validate_file)
+        try:
+            return await self.sys_run_in_executor(_validate_file)
+        except FileNotFoundError as err:
+            self.sys_create_task(self.sys_backups.reload(location))
+            raise BackupFileNotFoundError(
+                f"Cannot validate backup at {backup_file.as_posix()}, file does not exist!",
+                _LOGGER.error,
+            ) from err
 
     async def load(self):
         """Read backup.json from tar file."""
@@ -418,6 +457,9 @@ class Backup(JobGroup):
             )
             return False
 
+        if self._data[ATTR_PROTECTED]:
+            self._locations[self.location][ATTR_PROTECTED] = True
+
         return True
 
     @asynccontextmanager
@@ -452,10 +494,13 @@ class Backup(JobGroup):
             )
 
         backup_tarfile = (
-            self.tarfile if location == DEFAULT else self.all_locations[location]
+            self.tarfile
+            if location == DEFAULT
+            else self.all_locations[location][ATTR_PATH]
         )
         if not backup_tarfile.is_file():
-            raise BackupError(
+            self.sys_create_task(self.sys_backups.reload(location))
+            raise BackupFileNotFoundError(
                 f"Cannot open backup at {backup_tarfile.as_posix()}, file does not exist!",
                 _LOGGER.error,
             )
@@ -827,32 +872,3 @@ class Backup(JobGroup):
         return self.sys_store.update_repositories(
             self.repositories, add_with_errors=True, replace=replace
         )
-
-    def store_dockerconfig(self):
-        """Store the configuration for Docker."""
-        self.docker = {
-            ATTR_REGISTRIES: {
-                registry: {
-                    ATTR_USERNAME: credentials[ATTR_USERNAME],
-                    ATTR_PASSWORD: self._encrypt_data(credentials[ATTR_PASSWORD]),
-                }
-                for registry, credentials in self.sys_docker.config.registries.items()
-            }
-        }
-
-    def restore_dockerconfig(self, replace: bool = False):
-        """Restore the configuration for Docker."""
-        if replace:
-            self.sys_docker.config.registries.clear()
-
-        if ATTR_REGISTRIES in self.docker:
-            self.sys_docker.config.registries.update(
-                {
-                    registry: {
-                        ATTR_USERNAME: credentials[ATTR_USERNAME],
-                        ATTR_PASSWORD: self._decrypt_data(credentials[ATTR_PASSWORD]),
-                    }
-                    for registry, credentials in self.docker[ATTR_REGISTRIES].items()
-                }
-            )
-            self.sys_docker.config.save_data()

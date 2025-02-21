@@ -9,7 +9,7 @@ from typing import Self
 
 from aiohttp import __version__ as aiohttpversion
 
-SUPERVISOR_VERSION = "99.9.9dev"
+SUPERVISOR_VERSION = "9999.09.9.dev9999"
 SERVER_SOFTWARE = f"HomeAssistantSupervisor/{SUPERVISOR_VERSION} aiohttp/{aiohttpversion} Python/{systemversion[0]}.{systemversion[1]}"
 
 URL_HASSIO_ADDONS = "https://github.com/home-assistant/addons"
@@ -484,6 +484,7 @@ class BusEvent(StrEnum):
     DOCKER_CONTAINER_STATE_CHANGE = "docker_container_state_change"
     HARDWARE_NEW_DEVICE = "hardware_new_device"
     HARDWARE_REMOVE_DEVICE = "hardware_remove_device"
+    SUPERVISOR_CONNECTIVITY_CHANGE = "supervisor_connectivity_change"
     SUPERVISOR_JOB_END = "supervisor_job_end"
     SUPERVISOR_JOB_START = "supervisor_job_start"
     SUPERVISOR_STATE_CHANGE = "supervisor_state_change"

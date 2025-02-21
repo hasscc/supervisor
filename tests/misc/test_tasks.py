@@ -171,6 +171,7 @@ async def test_watchdog_homeassistant_api_reanimation_limit(
         rebuild.assert_not_called()
 
 
+@pytest.mark.usefixtures("no_job_throttle")
 async def test_reload_updater_triggers_supervisor_update(
     tasks: Tasks, coresys: CoreSys
 ):
@@ -222,9 +223,7 @@ async def test_core_backup_cleanup(
 
     # Put an old and new backup in folder
     copy(get_fixture_path("backup_example.tar"), coresys.config.path_core_backup)
-    await coresys.backups.reload(
-        location=".cloud_backup", filename="backup_example.tar"
-    )
+    await coresys.backups.reload()
     assert (old_backup := coresys.backups.get("7fed74c8"))
     new_backup = await coresys.backups.do_backup_partial(
         name="test", folders=["ssl"], location=".cloud_backup"

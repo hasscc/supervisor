@@ -60,12 +60,15 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
 HOMEASSISTANT_BACKUP_EXCLUDE = [
+    "**/__pycache__/*",
+    "**/.DS_Store",
     "*.db-shm",
     "*.corrupt.*",
-    "__pycache__/*",
-    "*.log",
     "*.log.*",
+    "*.log",
     "OZW_Log.txt",
+    "backups/*.tar",
+    "tmp_backups/*.tar",
     "tts/*",
 ]
 HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE = [
@@ -356,7 +359,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
             )
         except HomeAssistantWSError as err:
             raise HomeAssistantBackupError(
-                "Preparing backup of Home Assistant Core failed. Check HA Core logs.",
+                f"Preparing backup of Home Assistant Core failed. Failed to inform HA Core: {str(err)}.",
                 _LOGGER.error,
             ) from err
 
@@ -373,9 +376,10 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
             resp = await self.websocket.async_send_command(
                 {ATTR_TYPE: WSType.BACKUP_END}
             )
-        except HomeAssistantWSError:
+        except HomeAssistantWSError as err:
             _LOGGER.warning(
-                "Error resuming normal operations after backup of Home Assistant Core. Check HA Core logs."
+                "Error resuming normal operations after backup of Home Assistant Core. Failed to inform HA Core: %s.",
+                str(err),
             )
         else:
             if resp and not resp.get(ATTR_SUCCESS):
@@ -419,7 +423,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                         def is_excluded_by_filter(path: PurePath) -> bool:
                             """Filter to filter excludes."""
                             for exclude in excludes:
-                                if not path.match(exclude):
+                                if not path.full_match(f"data/{exclude}"):
                                     continue
                                 _LOGGER.debug(
                                     "Ignoring %s because of %s", path, exclude
