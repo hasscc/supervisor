@@ -2,8 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, Generator
-from functools import partial
-from inspect import unwrap
+from datetime import datetime
 import os
 from pathlib import Path
 import subprocess
@@ -40,6 +39,7 @@ from supervisor.const import (
     ATTR_TYPE,
     ATTR_VERSION,
     REQUEST_FROM,
+    CoreState,
 )
 from supervisor.coresys import CoreSys
 from supervisor.dbus.network import NetworkManager
@@ -97,21 +97,16 @@ async def docker() -> DockerAPI:
             "supervisor.docker.manager.DockerAPI.info",
             return_value=MagicMock(),
         ),
-        patch(
-            "supervisor.docker.manager.DockerConfig",
-            return_value=MagicMock(),
-        ),
         patch("supervisor.docker.manager.DockerAPI.unload"),
     ):
         docker_obj = DockerAPI(MagicMock())
+        docker_obj.config._data = {"registries": {}}
         with patch("supervisor.docker.monitor.DockerMonitor.load"):
             await docker_obj.load()
 
         docker_obj.info.logging = "journald"
         docker_obj.info.storage = "overlay2"
         docker_obj.info.version = "1.0.0"
-
-        docker_obj.config.registries = {}
 
         yield docker_obj
 
@@ -313,30 +308,32 @@ async def coresys(
     dbus_session_bus,
     all_dbus_services,
     aiohttp_client,
-    run_dir,
+    run_supervisor_state,
     supervisor_name,
 ) -> CoreSys:
     """Create a CoreSys Mock."""
     with (
         patch("supervisor.bootstrap.initialize_system"),
         patch("supervisor.utils.sentry.sentry_sdk.init"),
+        patch("supervisor.core.Core._write_run_state"),
     ):
         coresys_obj = await initialize_coresys()
 
     # Mock save json
-    coresys_obj._ingress.save_data = MagicMock()
-    coresys_obj._auth.save_data = MagicMock()
-    coresys_obj._updater.save_data = MagicMock()
-    coresys_obj._config.save_data = MagicMock()
-    coresys_obj._jobs.save_data = MagicMock()
-    coresys_obj._resolution.save_data = MagicMock()
-    coresys_obj._addons.data.save_data = MagicMock()
-    coresys_obj._store.save_data = MagicMock()
-    coresys_obj._mounts.save_data = MagicMock()
+    coresys_obj._ingress.save_data = AsyncMock()
+    coresys_obj._auth.save_data = AsyncMock()
+    coresys_obj._updater.save_data = AsyncMock()
+    coresys_obj._config.save_data = AsyncMock()
+    coresys_obj._jobs.save_data = AsyncMock()
+    coresys_obj._resolution.save_data = AsyncMock()
+    coresys_obj._addons.data.save_data = AsyncMock()
+    coresys_obj._store.save_data = AsyncMock()
+    coresys_obj._mounts.save_data = AsyncMock()
 
     # Mock test client
     coresys_obj._supervisor.instance._meta = {
-        "Config": {"Labels": {"io.hass.arch": "amd64"}}
+        "Config": {"Labels": {"io.hass.arch": "amd64"}},
+        "HostConfig": {"Privileged": True},
     }
     coresys_obj.arch._default_arch = "amd64"
     coresys_obj.arch._supported_set = {"amd64"}
@@ -381,11 +378,6 @@ async def coresys(
         ha_version=AwesomeVersion("2021.2.4")
     )
 
-    # Remove rate limiting decorator from fetch_data
-    coresys_obj.updater.fetch_data = partial(
-        unwrap(coresys_obj.updater.fetch_data), coresys_obj.updater
-    )
-
     # Don't remove files/folders related to addons and stores
     with patch("supervisor.store.git.GitRepo._remove"):
         yield coresys_obj
@@ -395,9 +387,14 @@ async def coresys(
 
 
 @pytest.fixture
-def ha_ws_client(coresys: CoreSys) -> AsyncMock:
+async def ha_ws_client(coresys: CoreSys) -> AsyncMock:
     """Return HA WS client mock for assertions."""
-    return coresys.homeassistant.websocket._client
+    # Set Supervisor Core state to RUNNING, otherwise WS events won't be delivered
+    await coresys.core.set_state(CoreState.RUNNING)
+    await asyncio.sleep(0)
+    client = coresys.homeassistant.websocket._client
+    client.async_send_command.reset_mock()
+    return client
 
 
 @pytest.fixture
@@ -505,12 +502,14 @@ def store_manager(coresys: CoreSys):
 
 
 @pytest.fixture
-def run_dir(tmp_path):
-    """Fixture to inject hassio env."""
-    with patch("supervisor.core.RUN_SUPERVISOR_STATE") as mock_run:
-        tmp_state = Path(tmp_path, "supervisor")
-        mock_run.write_text = tmp_state.write_text
-        yield tmp_state
+def run_supervisor_state(request: pytest.FixtureRequest) -> Generator[MagicMock]:
+    """Fixture to simulate Supervisor state file in /run/supervisor."""
+    if getattr(request, "param", "test_file"):
+        with patch("supervisor.core.RUN_SUPERVISOR_STATE") as mock_run:
+            yield mock_run
+    else:
+        with patch("supervisor.core.Core._write_run_state") as mock_write_state:
+            yield mock_write_state
 
 
 @pytest.fixture
@@ -522,6 +521,7 @@ def store_addon(coresys: CoreSys, tmp_path, repository):
     coresys.store.data.addons[addon_obj.slug] = SCHEMA_ADDON_SYSTEM(
         load_json_fixture("add-on.json")
     )
+    coresys.store.data.addons[addon_obj.slug]["location"] = tmp_path
     yield addon_obj
 
 
@@ -555,10 +555,10 @@ async def repository(coresys: CoreSys):
 
 
 @pytest.fixture
-def install_addon_ssh(coresys: CoreSys, repository):
+async def install_addon_ssh(coresys: CoreSys, repository):
     """Install local_ssh add-on."""
     store = coresys.addons.store[TEST_ADDON_SLUG]
-    coresys.addons.data.install(store)
+    await coresys.addons.data.install(store)
     coresys.addons.data._data = coresys.addons.data._schema(coresys.addons.data._data)
 
     addon = Addon(coresys, store.slug)
@@ -567,10 +567,10 @@ def install_addon_ssh(coresys: CoreSys, repository):
 
 
 @pytest.fixture
-def install_addon_example(coresys: CoreSys, repository):
+async def install_addon_example(coresys: CoreSys, repository):
     """Install local_example add-on."""
     store = coresys.addons.store["local_example"]
-    coresys.addons.data.install(store)
+    await coresys.addons.data.install(store)
     coresys.addons.data._data = coresys.addons.data._schema(coresys.addons.data._data)
 
     addon = Addon(coresys, store.slug)
@@ -581,7 +581,9 @@ def install_addon_example(coresys: CoreSys, repository):
 @pytest.fixture
 async def mock_full_backup(coresys: CoreSys, tmp_path) -> Backup:
     """Mock a full backup."""
-    mock_backup = Backup(coresys, Path(tmp_path, "test_backup.tar"), "test", None)
+    mock_backup = Backup(
+        coresys, Path(tmp_path, "test_backup.tar"), "test", None, None, 10240
+    )
     mock_backup.new("Test", utcnow().isoformat(), BackupType.FULL)
     mock_backup.repositories = ["https://github.com/awesome-developer/awesome-repo"]
     mock_backup.docker = {}
@@ -606,7 +608,9 @@ async def mock_full_backup(coresys: CoreSys, tmp_path) -> Backup:
 @pytest.fixture
 async def mock_partial_backup(coresys: CoreSys, tmp_path) -> Backup:
     """Mock a partial backup."""
-    mock_backup = Backup(coresys, Path(tmp_path, "test_backup.tar"), "test", None)
+    mock_backup = Backup(
+        coresys, Path(tmp_path, "test_backup.tar"), "test", None, None, 10240
+    )
     mock_backup.new("Test", utcnow().isoformat(), BackupType.PARTIAL)
     mock_backup.repositories = ["https://github.com/awesome-developer/awesome-repo"]
     mock_backup.docker = {}
@@ -765,3 +769,10 @@ def mock_is_mount() -> MagicMock:
     """Mock is_mount in mounts."""
     with patch("supervisor.mounts.mount.Path.is_mount", return_value=True) as is_mount:
         yield is_mount
+
+
+@pytest.fixture
+def no_job_throttle():
+    """Remove job throttle for tests."""
+    with patch("supervisor.jobs.decorator.Job.last_call", return_value=datetime.min):
+        yield

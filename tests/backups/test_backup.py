@@ -11,7 +11,12 @@ import pytest
 from supervisor.backups.backup import Backup
 from supervisor.backups.const import BackupType
 from supervisor.coresys import CoreSys
-from supervisor.exceptions import BackupFileNotFoundError
+from supervisor.exceptions import (
+    BackupFileExistError,
+    BackupFileNotFoundError,
+    BackupInvalidError,
+    BackupPermissionError,
+)
 
 from tests.common import get_fixture_path
 
@@ -28,6 +33,38 @@ async def test_new_backup_stays_in_folder(coresys: CoreSys, tmp_path: Path):
 
     assert len(listdir(tmp_path)) == 1
     assert backup.tarfile.exists()
+
+
+async def test_new_backup_permission_error(coresys: CoreSys, tmp_path: Path):
+    """Test if a permission error is correctly handled when a new backup is created."""
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+    assert not listdir(tmp_path)
+
+    with (
+        patch(
+            "tarfile.open",
+            MagicMock(side_effect=PermissionError),
+        ),
+        pytest.raises(BackupPermissionError),
+    ):
+        async with backup.create():
+            assert len(listdir(tmp_path)) == 1
+            assert backup.tarfile.exists()
+
+
+async def test_new_backup_exists_error(coresys: CoreSys, tmp_path: Path):
+    """Test if a permission error is correctly handled when a new backup is created."""
+    backup_file = tmp_path / "my_backup.tar"
+    backup = Backup(coresys, backup_file, "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+    backup_file.touch()
+
+    with (
+        pytest.raises(BackupFileExistError),
+    ):
+        async with backup.create():
+            pass
 
 
 async def test_consolidate_conflict_varied_encryption(
@@ -47,7 +84,9 @@ async def test_consolidate_conflict_varied_encryption(
         f"Backup d9c48f8b exists in two files in locations None. Ignoring {enc_tar.as_posix()}"
         in caplog.text
     )
-    assert enc_backup.all_locations == {None: {"path": unc_tar, "protected": False}}
+    assert enc_backup.all_locations == {
+        None: {"path": unc_tar, "protected": False, "size_bytes": 10240}
+    }
 
 
 async def test_consolidate(
@@ -72,29 +111,28 @@ async def test_consolidate(
         not in caplog.text
     )
     assert enc_backup.all_locations == {
-        None: {"path": enc_tar, "protected": True},
-        "backup_test": {"path": unc_tar, "protected": False},
+        None: {"path": enc_tar, "protected": True, "size_bytes": 10240},
+        "backup_test": {"path": unc_tar, "protected": False, "size_bytes": 10240},
     }
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "tarfile_side_effect, securetar_side_effect, expected_result, expect_exception",
+    "tarfile_side_effect, securetar_side_effect, expected_exception",
     [
-        (None, None, True, False),  # Successful validation
-        (FileNotFoundError, None, None, True),  # File not found
-        (None, tarfile.ReadError, False, False),  # Invalid password
+        (None, None, None),  # Successful validation
+        (FileNotFoundError, None, BackupFileNotFoundError),  # File not found
+        (None, tarfile.ReadError, BackupInvalidError),  # Invalid password
     ],
 )
-async def test_validate_password(
+async def test_validate_backup(
     coresys: CoreSys,
     tmp_path: Path,
     tarfile_side_effect,
     securetar_side_effect,
-    expected_result,
-    expect_exception,
+    expected_exception,
 ):
-    """Parameterized test for validate_password."""
+    """Parameterized test for validate_backup."""
     enc_tar = Path(copy(get_fixture_path("backup_example_enc.tar"), tmp_path))
     enc_backup = Backup(coresys, enc_tar, "test", None)
     await enc_backup.load()
@@ -120,9 +158,8 @@ async def test_validate_password(
             MagicMock(side_effect=securetar_side_effect),
         ),
     ):
-        if expect_exception:
-            with pytest.raises(BackupFileNotFoundError):
-                await enc_backup.validate_password(None)
+        if expected_exception:
+            with pytest.raises(expected_exception):
+                await enc_backup.validate_backup(None)
         else:
-            result = await enc_backup.validate_password(None)
-            assert result == expected_result
+            await enc_backup.validate_backup(None)

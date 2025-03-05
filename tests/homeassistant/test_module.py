@@ -49,11 +49,11 @@ async def test_load(
 
     assert coresys.homeassistant.secrets.secrets == {"hello": "world"}
 
-    coresys.core.state = CoreState.SETUP
+    await coresys.core.set_state(CoreState.SETUP)
     await coresys.homeassistant.websocket.async_send_message({"lorem": "ipsum"})
     ha_ws_client.async_send_command.assert_not_called()
 
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
     await asyncio.sleep(0)
     assert ha_ws_client.async_send_command.call_args_list[0][0][0] == {"lorem": "ipsum"}
 
@@ -66,21 +66,21 @@ async def test_get_users_none(coresys: CoreSys, ha_ws_client: AsyncMock):
     )
 
 
-def test_write_pulse_error(coresys: CoreSys, caplog: pytest.LogCaptureFixture):
+async def test_write_pulse_error(coresys: CoreSys, caplog: pytest.LogCaptureFixture):
     """Test errors writing pulse config."""
     with patch(
         "supervisor.homeassistant.module.Path.write_text",
         side_effect=(err := OSError()),
     ):
         err.errno = errno.EBUSY
-        coresys.homeassistant.write_pulse()
+        await coresys.homeassistant.write_pulse()
 
         assert "can't write pulse/client.config" in caplog.text
         assert coresys.core.healthy is True
 
         caplog.clear()
         err.errno = errno.EBADMSG
-        coresys.homeassistant.write_pulse()
+        await coresys.homeassistant.write_pulse()
 
         assert "can't write pulse/client.config" in caplog.text
         assert coresys.core.healthy is False
@@ -90,13 +90,13 @@ async def test_begin_backup_ws_error(coresys: CoreSys):
     """Test WS error when beginning backup."""
     # pylint: disable-next=protected-access
     coresys.homeassistant.websocket._client.async_send_command.side_effect = (
-        HomeAssistantWSConnectionError
+        HomeAssistantWSConnectionError("Connection was closed")
     )
     with (
         patch.object(HomeAssistantWebSocket, "_can_send", return_value=True),
         pytest.raises(
             HomeAssistantBackupError,
-            match="Preparing backup of Home Assistant Core failed. Check HA Core logs.",
+            match="Preparing backup of Home Assistant Core failed. Failed to inform HA Core: Connection was closed.",
         ),
     ):
         await coresys.homeassistant.begin_backup()
@@ -106,13 +106,13 @@ async def test_end_backup_ws_error(coresys: CoreSys, caplog: pytest.LogCaptureFi
     """Test WS error when ending backup."""
     # pylint: disable-next=protected-access
     coresys.homeassistant.websocket._client.async_send_command.side_effect = (
-        HomeAssistantWSConnectionError
+        HomeAssistantWSConnectionError("Connection was closed")
     )
     with patch.object(HomeAssistantWebSocket, "_can_send", return_value=True):
         await coresys.homeassistant.end_backup()
 
     assert (
-        "Error resuming normal operations after backup of Home Assistant Core. Check HA Core logs."
+        "Error resuming normal operations after backup of Home Assistant Core. Failed to inform HA Core: Connection was closed."
         in caplog.text
     )
 

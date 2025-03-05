@@ -20,7 +20,6 @@ from ..exceptions import HassioError, JobNotFound, JobStartException
 from ..homeassistant.const import WSEvent
 from ..utils.common import FileConfiguration
 from ..utils.dt import utcnow
-from ..utils.sentry import capture_exception
 from .const import ATTR_IGNORE_CONDITIONS, FILE_CONFIG_JOBS, JobCondition
 from .validate import SCHEMA_JOBS_CONFIG
 
@@ -191,9 +190,10 @@ class JobManager(FileConfiguration, CoreSysAttributes):
         """
         try:
             return self.get_job(_CURRENT_JOB.get())
-        except (LookupError, JobNotFound) as err:
-            capture_exception(err)
-            raise RuntimeError("No job for the current asyncio task!") from None
+        except (LookupError, JobNotFound):
+            raise RuntimeError(
+                "No job for the current asyncio task!", _LOGGER.critical
+            ) from None
 
     @property
     def is_job(self) -> bool:
@@ -213,9 +213,9 @@ class JobManager(FileConfiguration, CoreSysAttributes):
 
         if attribute.name == "done":
             if value is False:
-                self.sys_bus.fire_event(BusEvent.SUPERVISOR_JOB_START, job.uuid)
+                self.sys_bus.fire_event(BusEvent.SUPERVISOR_JOB_START, job)
             if value is True:
-                self.sys_bus.fire_event(BusEvent.SUPERVISOR_JOB_END, job.uuid)
+                self.sys_bus.fire_event(BusEvent.SUPERVISOR_JOB_END, job)
 
     def new_job(
         self,

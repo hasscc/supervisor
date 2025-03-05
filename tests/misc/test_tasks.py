@@ -171,12 +171,13 @@ async def test_watchdog_homeassistant_api_reanimation_limit(
         rebuild.assert_not_called()
 
 
+@pytest.mark.usefixtures("no_job_throttle")
 async def test_reload_updater_triggers_supervisor_update(
     tasks: Tasks, coresys: CoreSys
 ):
     """Test an updater reload triggers a supervisor update if there is one."""
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
     coresys.security.content_trust = False
 
     version_data = load_fixture("version_stable.json")
@@ -217,7 +218,7 @@ async def test_core_backup_cleanup(
     tasks: Tasks, coresys: CoreSys, tmp_supervisor_data: Path
 ):
     """Test core backup task cleans up old backup files."""
-    coresys.core.state = CoreState.RUNNING
+    await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
 
     # Put an old and new backup in folder

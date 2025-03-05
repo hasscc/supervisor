@@ -1,13 +1,11 @@
 """Representation of a backup file."""
 
 import asyncio
-from base64 import b64decode, b64encode
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Awaitable
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import timedelta
-from functools import lru_cache
 import io
 import json
 import logging
@@ -20,9 +18,8 @@ from typing import Any, Self
 
 from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from securetar import SecureTarFile, atomic_contents_add, secure_path
+from securetar import AddFileError, SecureTarFile, atomic_contents_add, secure_path
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
@@ -38,16 +35,14 @@ from ..const import (
     ATTR_FOLDERS,
     ATTR_HOMEASSISTANT,
     ATTR_NAME,
-    ATTR_PASSWORD,
     ATTR_PATH,
     ATTR_PROTECTED,
-    ATTR_REGISTRIES,
     ATTR_REPOSITORIES,
     ATTR_SIZE,
+    ATTR_SIZE_BYTES,
     ATTR_SLUG,
     ATTR_SUPERVISOR_VERSION,
     ATTR_TYPE,
-    ATTR_USERNAME,
     ATTR_VERSION,
     CRYPTO_AES128,
 )
@@ -55,8 +50,10 @@ from ..coresys import CoreSys
 from ..exceptions import (
     AddonsError,
     BackupError,
+    BackupFileExistError,
     BackupFileNotFoundError,
     BackupInvalidError,
+    BackupPermissionError,
 )
 from ..jobs.const import JOB_GROUP_BACKUP
 from ..jobs.decorator import Job
@@ -70,12 +67,6 @@ from .utils import key_to_iv, password_to_key
 from .validate import SCHEMA_BACKUP
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-
-@lru_cache
-def _backup_file_size(backup: Path) -> int:
-    """Get backup file size."""
-    return backup.stat().st_size if backup.is_file() else 0
 
 
 def location_sort_key(value: str | None) -> str:
@@ -93,13 +84,14 @@ class Backup(JobGroup):
         slug: str,
         location: str | None,
         data: dict[str, Any] | None = None,
+        size_bytes: int = 0,
     ):
         """Initialize a backup."""
         super().__init__(
             coresys, JOB_GROUP_BACKUP.format_map(defaultdict(str, slug=slug)), slug
         )
         self._data: dict[str, Any] = data or {ATTR_SLUG: slug}
-        self._tmp = None
+        self._tmp: TemporaryDirectory = None
         self._outer_secure_tarfile: SecureTarFile | None = None
         self._key: bytes | None = None
         self._aes: Cipher | None = None
@@ -107,6 +99,7 @@ class Backup(JobGroup):
             location: {
                 ATTR_PATH: tar_file,
                 ATTR_PROTECTED: data.get(ATTR_PROTECTED, False) if data else False,
+                ATTR_SIZE_BYTES: size_bytes,
             }
         }
 
@@ -241,7 +234,7 @@ class Backup(JobGroup):
     @property
     def size_bytes(self) -> int:
         """Return backup size in bytes."""
-        return self.location_size(self.location)
+        return self._locations[self.location][ATTR_SIZE_BYTES]
 
     @property
     def is_new(self) -> bool:
@@ -264,14 +257,6 @@ class Backup(JobGroup):
     def data(self) -> dict[str, Any]:
         """Returns a copy of the data."""
         return deepcopy(self._data)
-
-    def location_size(self, location: str | None) -> int:
-        """Get size of backup in a location."""
-        if location not in self.all_locations:
-            return 0
-
-        backup = self.all_locations[location][ATTR_PATH]
-        return _backup_file_size(backup)
 
     def __eq__(self, other: Any) -> bool:
         """Return true if backups have same metadata."""
@@ -371,36 +356,14 @@ class Backup(JobGroup):
             backend=default_backend(),
         )
 
-    def _encrypt_data(self, data: str) -> str:
-        """Make data secure."""
-        if not self._key or data is None:
-            return data
+    async def validate_backup(self, location: str | None) -> None:
+        """Validate backup.
 
-        encrypt = self._aes.encryptor()
-        padder = padding.PKCS7(128).padder()
-
-        data = padder.update(data.encode()) + padder.finalize()
-        return b64encode(encrypt.update(data)).decode()
-
-    def _decrypt_data(self, data: str) -> str:
-        """Make data readable."""
-        if not self._key or data is None:
-            return data
-
-        decrypt = self._aes.decryptor()
-        padder = padding.PKCS7(128).unpadder()
-
-        data = padder.update(decrypt.update(b64decode(data))) + padder.finalize()
-        return data.decode()
-
-    async def validate_password(self, location: str | None) -> bool:
-        """Validate backup password.
-
-        Returns false only when the password is known to be wrong.
+        Checks if we can access the backup file and decrypt if necessary.
         """
         backup_file: Path = self.all_locations[location][ATTR_PATH]
 
-        def _validate_file() -> bool:
+        def _validate_file() -> None:
             ending = f".tar{'.gz' if self.compressed else ''}"
 
             with tarfile.open(backup_file, "r:") as backup:
@@ -413,8 +376,8 @@ class Backup(JobGroup):
                     None,
                 )
                 if not test_tar_name:
-                    _LOGGER.warning("No tar file found to validate password with")
-                    return True
+                    # From Supervisor perspective, a metadata only backup only is valid.
+                    return
 
                 test_tar_file = backup.extractfile(test_tar_name)
                 try:
@@ -426,16 +389,14 @@ class Backup(JobGroup):
                         fileobj=test_tar_file,
                     ):
                         # If we can read the tar file, the password is correct
-                        return True
-                except tarfile.ReadError:
-                    _LOGGER.debug("Invalid password")
-                    return False
-                except Exception:  # pylint: disable=broad-exception-caught
-                    _LOGGER.exception("Unexpected error validating password")
-                    return True
+                        return
+                except tarfile.ReadError as ex:
+                    raise BackupInvalidError(
+                        f"Invalid password for backup {backup.slug}", _LOGGER.error
+                    ) from ex
 
         try:
-            return await self.sys_run_in_executor(_validate_file)
+            await self.sys_run_in_executor(_validate_file)
         except FileNotFoundError as err:
             self.sys_create_task(self.sys_backups.reload(location))
             raise BackupFileNotFoundError(
@@ -445,23 +406,24 @@ class Backup(JobGroup):
 
     async def load(self):
         """Read backup.json from tar file."""
-        if not self.tarfile.is_file():
-            _LOGGER.error("No tarfile located at %s", self.tarfile)
-            return False
 
-        def _load_file():
-            """Read backup.json."""
-            with tarfile.open(self.tarfile, "r:") as backup:
+        def _load_file(tarfile_path: Path):
+            """Get backup size and read backup metadata."""
+            size_bytes = tarfile_path.stat().st_size
+            with tarfile.open(tarfile_path, "r:") as backup:
                 if "./snapshot.json" in [entry.name for entry in backup.getmembers()]:
                     # Old backups stil uses "snapshot.json", we need to support that forever
                     json_file = backup.extractfile("./snapshot.json")
                 else:
                     json_file = backup.extractfile("./backup.json")
-                return json_file.read()
+                return size_bytes, json_file.read()
 
         # read backup.json
         try:
-            raw = await self.sys_run_in_executor(_load_file)
+            size_bytes, raw = await self.sys_run_in_executor(_load_file, self.tarfile)
+        except FileNotFoundError:
+            _LOGGER.error("No tarfile located at %s", self.tarfile)
+            return False
         except (tarfile.TarError, KeyError) as err:
             _LOGGER.error("Can't read backup tarfile %s: %s", self.tarfile, err)
             return False
@@ -486,29 +448,57 @@ class Backup(JobGroup):
 
         if self._data[ATTR_PROTECTED]:
             self._locations[self.location][ATTR_PROTECTED] = True
+        self._locations[self.location][ATTR_SIZE_BYTES] = size_bytes
 
         return True
 
     @asynccontextmanager
     async def create(self) -> AsyncGenerator[None]:
         """Create new backup file."""
-        if self.tarfile.is_file():
-            raise BackupError(
-                f"Cannot make new backup at {self.tarfile.as_posix()}, file already exists!",
-                _LOGGER.error,
-            )
 
-        self._outer_secure_tarfile = SecureTarFile(
-            self.tarfile,
-            "w",
-            gzip=False,
-            bufsize=BUF_SIZE,
+        def _open_outer_tarfile():
+            """Create and open outer tarfile."""
+            if self.tarfile.is_file():
+                raise BackupFileExistError(
+                    f"Cannot make new backup at {self.tarfile.as_posix()}, file already exists!",
+                    _LOGGER.error,
+                )
+
+            _outer_secure_tarfile = SecureTarFile(
+                self.tarfile,
+                "w",
+                gzip=False,
+                bufsize=BUF_SIZE,
+            )
+            try:
+                _outer_tarfile = _outer_secure_tarfile.open()
+            except PermissionError as ex:
+                raise BackupPermissionError(
+                    f"Cannot open backup file {self.tarfile.as_posix()}, permission error!",
+                    _LOGGER.error,
+                ) from ex
+            except OSError as ex:
+                raise BackupError(
+                    f"Cannot open backup file {self.tarfile.as_posix()} for writing",
+                    _LOGGER.error,
+                ) from ex
+
+            return _outer_secure_tarfile, _outer_tarfile
+
+        def _close_outer_tarfile() -> int:
+            """Close outer tarfile."""
+            self._outer_secure_tarfile.close()
+            return self.tarfile.stat().st_size
+
+        self._outer_secure_tarfile, outer_tarfile = await self.sys_run_in_executor(
+            _open_outer_tarfile
         )
         try:
-            with self._outer_secure_tarfile as outer_tarfile:
-                yield
-                await self._create_cleanup(outer_tarfile)
+            yield
         finally:
+            await self._create_cleanup(outer_tarfile)
+            size_bytes = await self.sys_run_in_executor(_close_outer_tarfile)
+            self._locations[self.location][ATTR_SIZE_BYTES] = size_bytes
             self._outer_secure_tarfile = None
 
     @asynccontextmanager
@@ -525,28 +515,34 @@ class Backup(JobGroup):
             if location == DEFAULT
             else self.all_locations[location][ATTR_PATH]
         )
-        if not backup_tarfile.is_file():
-            self.sys_create_task(self.sys_backups.reload(location))
-            raise BackupFileNotFoundError(
-                f"Cannot open backup at {backup_tarfile.as_posix()}, file does not exist!",
-                _LOGGER.error,
-            )
 
         # extract an existing backup
-        self._tmp = TemporaryDirectory(dir=str(backup_tarfile.parent))
-
         def _extract_backup():
-            """Extract a backup."""
+            if not backup_tarfile.is_file():
+                raise BackupFileNotFoundError(
+                    f"Cannot open backup at {backup_tarfile.as_posix()}, file does not exist!",
+                    _LOGGER.error,
+                )
+            tmp = TemporaryDirectory(dir=str(backup_tarfile.parent))
+
             with tarfile.open(backup_tarfile, "r:") as tar:
                 tar.extractall(
-                    path=self._tmp.name,
+                    path=tmp.name,
                     members=secure_path(tar),
                     filter="fully_trusted",
                 )
 
-        with self._tmp:
-            await self.sys_run_in_executor(_extract_backup)
+            return tmp
+
+        try:
+            self._tmp = await self.sys_run_in_executor(_extract_backup)
             yield
+        except BackupFileNotFoundError as err:
+            self.sys_create_task(self.sys_backups.reload(location))
+            raise err
+        finally:
+            if self._tmp:
+                self._tmp.cleanup()
 
     async def _create_cleanup(self, outer_tarfile: TarFile) -> None:
         """Cleanup after backup creation.
@@ -698,17 +694,16 @@ class Backup(JobGroup):
     async def _folder_save(self, name: str):
         """Take backup of a folder."""
         self.sys_jobs.current.reference = name
-
         slug_name = name.replace("/", "_")
         tar_name = f"{slug_name}.tar{'.gz' if self.compressed else ''}"
         origin_dir = Path(self.sys_config.path_supervisor, name)
 
-        # Check if exists
-        if not origin_dir.is_dir():
-            _LOGGER.warning("Can't find backup folder %s", name)
-            return
+        def _save() -> bool:
+            # Check if exists
+            if not origin_dir.is_dir():
+                _LOGGER.warning("Can't find backup folder %s", name)
+                return False
 
-        def _save() -> None:
             # Take backup
             _LOGGER.info("Backing up folder %s", name)
 
@@ -741,15 +736,15 @@ class Backup(JobGroup):
                 )
 
             _LOGGER.info("Backup folder %s done", name)
+            return True
 
         try:
-            await self.sys_run_in_executor(_save)
-        except (tarfile.TarError, OSError) as err:
+            if await self.sys_run_in_executor(_save):
+                self._data[ATTR_FOLDERS].append(name)
+        except (tarfile.TarError, OSError, AddFileError) as err:
             raise BackupError(
                 f"Can't backup folder {name}: {str(err)}", _LOGGER.error
             ) from err
-
-        self._data[ATTR_FOLDERS].append(name)
 
     @Job(name="backup_store_folders", cleanup=False)
     async def store_folders(self, folder_list: list[str]):
@@ -769,28 +764,18 @@ class Backup(JobGroup):
         )
         origin_dir = Path(self.sys_config.path_supervisor, name)
 
-        # Check if exists inside backup
-        if not tar_name.exists():
-            raise BackupInvalidError(
-                f"Can't find restore folder {name}", _LOGGER.warning
-            )
-
-        # Unmount any mounts within folder
-        bind_mounts = [
-            bound.bind_mount
-            for bound in self.sys_mounts.bound_mounts
-            if bound.bind_mount.local_where
-            and bound.bind_mount.local_where.is_relative_to(origin_dir)
-        ]
-        if bind_mounts:
-            await asyncio.gather(*[bind_mount.unmount() for bind_mount in bind_mounts])
-
-        # Clean old stuff
-        if origin_dir.is_dir():
-            await remove_folder(origin_dir, content_only=True)
-
         # Perform a restore
         def _restore() -> bool:
+            # Check if exists inside backup
+            if not tar_name.exists():
+                raise BackupInvalidError(
+                    f"Can't find restore folder {name}", _LOGGER.warning
+                )
+
+            # Clean old stuff
+            if origin_dir.is_dir():
+                remove_folder(origin_dir, content_only=True)
+
             try:
                 _LOGGER.info("Restore folder %s", name)
                 with SecureTarFile(
@@ -809,6 +794,16 @@ class Backup(JobGroup):
                     f"Can't restore folder {name}: {err}", _LOGGER.warning
                 ) from err
             return True
+
+        # Unmount any mounts within folder
+        bind_mounts = [
+            bound.bind_mount
+            for bound in self.sys_mounts.bound_mounts
+            if bound.bind_mount.local_where
+            and bound.bind_mount.local_where.is_relative_to(origin_dir)
+        ]
+        if bind_mounts:
+            await asyncio.gather(*[bind_mount.unmount() for bind_mount in bind_mounts])
 
         try:
             return await self.sys_run_in_executor(_restore)
@@ -899,32 +894,3 @@ class Backup(JobGroup):
         return self.sys_store.update_repositories(
             self.repositories, add_with_errors=True, replace=replace
         )
-
-    def store_dockerconfig(self):
-        """Store the configuration for Docker."""
-        self.docker = {
-            ATTR_REGISTRIES: {
-                registry: {
-                    ATTR_USERNAME: credentials[ATTR_USERNAME],
-                    ATTR_PASSWORD: self._encrypt_data(credentials[ATTR_PASSWORD]),
-                }
-                for registry, credentials in self.sys_docker.config.registries.items()
-            }
-        }
-
-    def restore_dockerconfig(self, replace: bool = False):
-        """Restore the configuration for Docker."""
-        if replace:
-            self.sys_docker.config.registries.clear()
-
-        if ATTR_REGISTRIES in self.docker:
-            self.sys_docker.config.registries.update(
-                {
-                    registry: {
-                        ATTR_USERNAME: credentials[ATTR_USERNAME],
-                        ATTR_PASSWORD: self._decrypt_data(credentials[ATTR_PASSWORD]),
-                    }
-                    for registry, credentials in self.docker[ATTR_REGISTRIES].items()
-                }
-            )
-            self.sys_docker.config.save_data()
