@@ -19,7 +19,7 @@ from ..homeassistant.const import LANDINGPAGE
 from ..jobs.decorator import Job, JobCondition, JobExecutionLimit
 from ..plugins.const import PLUGIN_UPDATE_CONDITIONS
 from ..utils.dt import utcnow
-from ..utils.sentry import capture_exception
+from ..utils.sentry import async_capture_exception
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ class Tasks(CoreSysAttributes):
                 await self.sys_homeassistant.core.restart()
         except HomeAssistantError as err:
             if reanimate_fails == 0 or safe_mode:
-                capture_exception(err)
+                await async_capture_exception(err)
 
             if safe_mode:
                 _LOGGER.critical(
@@ -341,7 +341,7 @@ class Tasks(CoreSysAttributes):
                 await (await addon.restart())
             except AddonsError as err:
                 _LOGGER.error("%s watchdog reanimation failed with %s", addon.slug, err)
-                capture_exception(err)
+                await async_capture_exception(err)
             finally:
                 self._cache[addon.slug] = 0
 
@@ -370,6 +370,6 @@ class Tasks(CoreSysAttributes):
         ]
         for backup in old_backups:
             try:
-                self.sys_backups.remove(backup, [LOCATION_CLOUD_BACKUP])
+                await self.sys_backups.remove(backup, [LOCATION_CLOUD_BACKUP])
             except BackupFileNotFoundError as err:
                 _LOGGER.debug("Can't remove backup %s: %s", backup.slug, err)

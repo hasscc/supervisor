@@ -3,7 +3,7 @@ name: Sentry Release
 # yamllint disable-line rule:truthy
 on:
   release:
-    types: [published, prereleased]
+    types: [prereleased]
 
 jobs:
   createSentryRelease:
@@ -12,8 +12,7 @@ jobs:
       - name: Check out code from GitHub
         uses: actions/checkout@v4.2.2
       - name: Sentry Release
-        uses: getsentry/action-release@v1.10.4
-        if: ${{ secrets.SENTRY_ORG != '' }}
+        uses: getsentry/action-release@v3.0.0
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_ORG: ${{ secrets.SENTRY_ORG }}

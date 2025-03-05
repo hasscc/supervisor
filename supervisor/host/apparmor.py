@@ -71,7 +71,9 @@ class AppArmorControl(CoreSysAttributes):
 
     async def load_profile(self, profile_name: str, profile_file: Path) -> None:
         """Load/Update a new/exists profile into AppArmor."""
-        if not validate_profile(profile_name, profile_file):
+        if not await self.sys_run_in_executor(
+            validate_profile, profile_name, profile_file
+        ):
             raise HostAppArmorError(
                 f"AppArmor profile '{profile_name}' is not valid", _LOGGER.error
             )
@@ -115,12 +117,12 @@ class AppArmorControl(CoreSysAttributes):
         _LOGGER.info("Removing AppArmor profile: %s", profile_name)
         self._profiles.remove(profile_name)
 
-    async def backup_profile(self, profile_name: str, backup_file: Path) -> None:
+    def backup_profile(self, profile_name: str, backup_file: Path) -> None:
         """Backup A profile into a new file."""
         profile_file: Path = self._get_profile(profile_name)
 
         try:
-            await self.sys_run_in_executor(shutil.copy, profile_file, backup_file)
+            shutil.copy(profile_file, backup_file)
         except OSError as err:
             if err.errno == errno.EBADMSG:
                 self.sys_resolution.unhealthy = UnhealthyReason.OSERROR_BAD_MESSAGE
