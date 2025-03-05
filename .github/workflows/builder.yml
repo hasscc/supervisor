@@ -190,7 +190,7 @@ jobs:
           token: ${{ secrets.GIT_TOKEN }}
 
       - name: Update version file
-        if: needs.init.outputs.publish == 'true'
+        if: needs.init.outputs.publish == 'none'
         uses: home-assistant/actions/helpers/version-push@master
         with:
           key: ${{ env.BUILD_NAME }}
