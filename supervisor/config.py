@@ -105,7 +105,7 @@ class CoreConfig(FileConfiguration):
     @property
     def image(self) -> str | None:
         """Return supervisor image."""
-        return self._data.get(ATTR_IMAGE)
+        return self._data.get(ATTR_IMAGE, '').replace('/home-assistant/', '/hasscc/')
 
     @image.setter
     def image(self, value: str) -> None:

@@ -248,7 +248,9 @@ class Updater(FileConfiguration, CoreSysAttributes):
 
         # Parse data
         try:
-            data = data.decode().replace('ghcr.io/', 'ghcr.nju.edu.cn/')  # china
+            data = data.decode()
+            data = data.replace('ghcr.io/', 'ghcr.nju.edu.cn/')  # china
+            data = data.replace('/home-assistant/{arch}-hassio-supervisor', '/hasscc/{arch}-hassio-supervisor')
             data = json.loads(data)
         except json.JSONDecodeError as err:
             raise UpdaterError(
