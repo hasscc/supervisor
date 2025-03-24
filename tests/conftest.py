@@ -12,6 +12,7 @@ from uuid import uuid4
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
+from blockbuster import BlockBuster, blockbuster_ctx
 from dbus_fast import BusType
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
@@ -63,6 +64,19 @@ from .dbus_service_mocks.network_manager import NetworkManager as NetworkManager
 # pylint: disable=redefined-outer-name, protected-access
 
 
+@pytest.fixture(autouse=True)
+def blockbuster() -> BlockBuster:
+    """Raise for blocking I/O in event loop."""
+    # Only scanning supervisor code for now as that's our primary interest
+    # This will still raise for tests that call utilities in supervisor code that block
+    # But it will ignore calls to libraries and such that do blocking I/O directly from tests
+    # Removing that would be nice but a todo for the future
+
+    # pylint: disable-next=contextmanager-generator-missing-cleanup
+    with blockbuster_ctx(scanned_modules=["supervisor"]) as bb:
+        yield bb
+
+
 @pytest.fixture
 async def path_extern() -> None:
     """Set external path env for tests."""
@@ -99,7 +113,7 @@ async def docker() -> DockerAPI:
         ),
         patch("supervisor.docker.manager.DockerAPI.unload"),
     ):
-        docker_obj = DockerAPI(MagicMock())
+        docker_obj = await DockerAPI(MagicMock()).post_init()
         docker_obj.config._data = {"registries": {}}
         with patch("supervisor.docker.monitor.DockerMonitor.load"):
             await docker_obj.load()
