@@ -166,10 +166,12 @@ jobs:
       - name: Check frozen version
         id: frozen
         run: |
-          if [[ github.ref == 'refs/heads/frozen' ]]; then
-            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}-frozen" >> "$GITHUB_OUTPUT"
+          if [[ "${{ needs.init.outputs.version }}" == "frozen" ]]; then
+            echo "IMAGE_VERSION=dev-$(date +%Y%m%d)-frozen" >> $GITHUB_ENV
+          elif [[ "${{ github.ref }}" == "refs/heads/frozen" ]]; then
+            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}-frozen" >> $GITHUB_ENV
           else
-            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}" >> $GITHUB_ENV
           fi
 
       - name: Build supervisor
