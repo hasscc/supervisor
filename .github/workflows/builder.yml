@@ -18,12 +18,16 @@ on:
         description: "Stable"
         required: true
         default: "false"
+      frozen:
+        description: "Frozen Version"
+        required: true
+        default: "false"
   pull_request:
     branches: ["main"]
   release:
     types: ["published"]
   push:
-    branches: ["main"]
+    branches: ["main", "frozen"]
     paths:
       - "rootfs/**"
       - "supervisor/**"
@@ -159,6 +163,15 @@ jobs:
         if: needs.init.outputs.publish == 'false'
         run: echo "BUILD_ARGS=--test" >> $GITHUB_ENV
 
+      - name: Check frozen version
+        id: frozen
+        run: |
+          if [[ github.ref == 'refs/heads/frozen' ]]; then
+            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}-frozen" >> "$GITHUB_OUTPUT"
+          else
+            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build supervisor
         uses: home-assistant/builder@2025.03.0
         with:
@@ -168,7 +181,7 @@ jobs:
             --target /data \
             --cosign \
             --docker-hub ghcr.io/${{ github.repository_owner }} \
-            --generic ${{ needs.init.outputs.version }}
+            --generic ${{ env.IMAGE_VERSION }}
         env:
           CAS_API_KEY: ${{ secrets.CAS_TOKEN }}
 
