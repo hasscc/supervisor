@@ -211,6 +211,16 @@ class Updater(FileConfiguration, CoreSysAttributes):
 
         # Get data
         try:
+            import os
+            version_file = "/etc/hassio-version.json"
+            if os.path.exists(version_file):
+                _LOGGER.info("Found frozen version file: %s", version_file)
+                with open(version_file) as file:
+                    data = file.read()
+                    if data:
+                        self.coresys.security.content_trust = False
+                        raise FileExistsError
+
             _LOGGER.info("Fetching update data from %s", url)
             timeout = aiohttp.ClientTimeout(total=10)
             async with self.sys_websession.get(url, timeout=timeout) as request:
@@ -227,6 +237,9 @@ class Updater(FileConfiguration, CoreSysAttributes):
                 f"Can't fetch versions from {url}: {str(err) or 'Timeout'}",
                 _LOGGER.warning,
             ) from err
+
+        except FileExistsError:
+            pass
 
         # Fetch was successful. If there's a connectivity listener, time to remove it
         if self._connectivity_listener:

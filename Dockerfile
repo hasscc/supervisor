@@ -9,6 +9,7 @@ ENV \
 
 ARG \
     COSIGN_VERSION \
+    BUILD_VERSION \
     BUILD_ARCH
 
 # Install base
@@ -28,6 +29,9 @@ RUN \
     \
     && curl -Lso /usr/bin/cosign "https://github.com/home-assistant/cosign/releases/download/${COSIGN_VERSION}/cosign_${BUILD_ARCH}" \
     && chmod a+x /usr/bin/cosign \
+    if [[ "${BUILD_VERSION}" =~ "frozen" ]]; then \
+        curl -Lso /etc/hassio-version.json https://version.home-assistant.io/stable.json; \
+    fi \
     && pip3 install uv==0.2.21
 
 # Install requirements
