@@ -51,10 +51,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       architectures: ${{ steps.info.outputs.architectures }}
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.frozen.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
       publish: ${{ steps.version.outputs.publish }}
       requirements: ${{ steps.requirements.outputs.changed }}
+      build_args: ${{ steps.frozen.outputs.build_args }}
     steps:
       - name: Checkout the repository
         uses: actions/checkout@v4.2.2
@@ -81,6 +82,19 @@ jobs:
         run: |
           if [[ "${{ steps.changed_files.outputs.all }}" =~ (requirements.txt|build.yaml) ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check frozen version
+        id: frozen
+        run: |
+          if [[ "${{ steps.version.outputs.version }}" == "frozen" ]]; then
+            echo "version=dev-$(date +%Y%m%d)-frozen" >> $GITHUB_OUTPUT
+            echo "build_args=--no-latest" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/frozen" ]]; then
+            echo "version=${{ steps.version.outputs.version }}-frozen" >> $GITHUB_OUTPUT
+            echo "build_args=--no-latest" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ steps.version.outputs.version }}" >> $GITHUB_OUTPUT
           fi
 
   build:
@@ -163,27 +177,16 @@ jobs:
         if: needs.init.outputs.publish == 'false'
         run: echo "BUILD_ARGS=--test" >> $GITHUB_ENV
 
-      - name: Check frozen version
-        id: frozen
-        run: |
-          if [[ "${{ needs.init.outputs.version }}" == "frozen" ]]; then
-            echo "IMAGE_VERSION=dev-$(date +%Y%m%d)-frozen" >> $GITHUB_ENV
-          elif [[ "${{ github.ref }}" == "refs/heads/frozen" ]]; then
-            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}-frozen" >> $GITHUB_ENV
-          else
-            echo "IMAGE_VERSION=${{ needs.init.outputs.version }}" >> $GITHUB_ENV
-          fi
-
       - name: Build supervisor
         uses: home-assistant/builder@2025.03.0
         with:
           args: |
-            $BUILD_ARGS \
+            $BUILD_ARGS ${{ needs.init.outputs.build_args }} \
             --${{ matrix.arch }} \
             --target /data \
             --cosign \
             --docker-hub ghcr.io/${{ github.repository_owner }} \
-            --generic ${{ env.IMAGE_VERSION }}
+            --generic ${{ needs.init.outputs.version }}
         env:
           CAS_API_KEY: ${{ secrets.CAS_TOKEN }}
 
