@@ -214,11 +214,12 @@ class Updater(FileConfiguration, CoreSysAttributes):
             import os
             version_file = "/etc/hassio-version.json"
             if os.path.exists(version_file):
-                _LOGGER.info("Found frozen version file: %s", version_file)
                 with open(version_file) as file:
-                    data = file.read()
-                    if data:
+                    content = file.read()
+                    if content:
+                        data = content.encode()
                         self.coresys.security.content_trust = False
+                        _LOGGER.info("Using frozen versions: %s", content)
                         raise FileExistsError
 
             _LOGGER.info("Fetching update data from %s", url)
