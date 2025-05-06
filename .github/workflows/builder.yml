@@ -82,7 +82,6 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} supervisor
     needs: init
-    if: matrix.arch != 'i386'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -161,6 +160,7 @@ jobs:
         run: echo "BUILD_ARGS=--test" >> $GITHUB_ENV
 
       - name: Build supervisor
+        if: matrix.arch != 'i386'
         uses: home-assistant/builder@2025.03.0
         with:
           pull: false # https://github.com/home-assistant/builder/blob/2025.03.0/action.yml#L8
