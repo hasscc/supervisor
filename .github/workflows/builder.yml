@@ -82,6 +82,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }} supervisor
     needs: init
+    if: matrix.arch != 'i386'
     runs-on: ubuntu-latest
     permissions:
       contents: read
