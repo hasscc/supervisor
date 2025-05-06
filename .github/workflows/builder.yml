@@ -162,6 +162,7 @@ jobs:
       - name: Build supervisor
         uses: home-assistant/builder@2025.03.0
         with:
+          pull: false # https://github.com/home-assistant/builder/blob/2025.03.0/action.yml#L8
           args: |
             $BUILD_ARGS \
             --${{ matrix.arch }} \
