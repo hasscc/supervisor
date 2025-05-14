@@ -8,7 +8,7 @@ from .const import StoreType
 
 URL_COMMUNITY_ADDONS = "https://gitee.com/hassio/addons"
 URL_ESPHOME = "https://gitee.com/hassio/esphome-addon"
-URL_MUSIC_ASSISTANT = "https://github.com/music-assistant/home-assistant-addon"
+URL_MUSIC_ASSISTANT = "https://gitee.com/hassio/music-assistant-addon"
 BUILTIN_REPOSITORIES = {
     StoreType.CORE,
     StoreType.LOCAL,

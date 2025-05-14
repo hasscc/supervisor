@@ -5,6 +5,7 @@ import errno
 from functools import partial
 from pathlib import Path
 from shutil import copy, rmtree
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, patch
 
 from awesomeversion import AwesomeVersion
@@ -14,7 +15,7 @@ import pytest
 from supervisor.addons.addon import Addon
 from supervisor.addons.const import AddonBackupMode
 from supervisor.addons.model import AddonModel
-from supervisor.backups.backup import Backup
+from supervisor.backups.backup import Backup, BackupLocation
 from supervisor.backups.const import LOCATION_TYPE, BackupType
 from supervisor.backups.manager import BackupManager
 from supervisor.const import FOLDER_HOMEASSISTANT, FOLDER_SHARE, AddonState, CoreState
@@ -216,7 +217,9 @@ async def test_do_backup_partial_maximal(
     assert coresys.core.state == CoreState.RUNNING
 
 
-async def test_do_restore_full(coresys: CoreSys, full_backup_mock, install_addon_ssh):
+async def test_do_restore_full(
+    coresys: CoreSys, supervisor_internet, full_backup_mock, install_addon_ssh
+):
     """Test restoring full Backup."""
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
@@ -246,7 +249,7 @@ async def test_do_restore_full(coresys: CoreSys, full_backup_mock, install_addon
 
 
 async def test_do_restore_full_different_addon(
-    coresys: CoreSys, full_backup_mock, install_addon_ssh
+    coresys: CoreSys, supervisor_internet, full_backup_mock, install_addon_ssh
 ):
     """Test restoring full Backup with different addons than installed."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -278,7 +281,7 @@ async def test_do_restore_full_different_addon(
 
 
 async def test_do_restore_partial_minimal(
-    coresys: CoreSys, partial_backup_mock, install_addon_ssh
+    coresys: CoreSys, supervisor_internet, partial_backup_mock, install_addon_ssh
 ):
     """Test restoring partial Backup minimal."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -302,7 +305,9 @@ async def test_do_restore_partial_minimal(
     assert coresys.core.state == CoreState.RUNNING
 
 
-async def test_do_restore_partial_maximal(coresys: CoreSys, partial_backup_mock):
+async def test_do_restore_partial_maximal(
+    coresys: CoreSys, supervisor_internet, partial_backup_mock
+):
     """Test restoring partial Backup minimal."""
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
@@ -332,7 +337,10 @@ async def test_do_restore_partial_maximal(coresys: CoreSys, partial_backup_mock)
 
 
 async def test_fail_invalid_full_backup(
-    coresys: CoreSys, full_backup_mock: MagicMock, partial_backup_mock: MagicMock
+    coresys: CoreSys,
+    supervisor_internet,
+    full_backup_mock: MagicMock,
+    partial_backup_mock: MagicMock,
 ):
     """Test restore fails with invalid backup."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -344,13 +352,13 @@ async def test_fail_invalid_full_backup(
         await manager.do_restore_full(partial_backup_mock.return_value)
 
     backup_instance = full_backup_mock.return_value
-    backup_instance.all_locations[None]["protected"] = True
+    backup_instance.all_locations[None].protected = True
     backup_instance.validate_backup.side_effect = BackupInvalidError()
 
     with pytest.raises(BackupInvalidError):
         await manager.do_restore_full(backup_instance)
 
-    backup_instance.all_locations[None]["protected"] = False
+    backup_instance.all_locations[None].protected = False
     backup_instance.supervisor_version = "2022.08.4"
     with (
         patch.object(
@@ -364,7 +372,7 @@ async def test_fail_invalid_full_backup(
 
 
 async def test_fail_invalid_partial_backup(
-    coresys: CoreSys, partial_backup_mock: MagicMock
+    coresys: CoreSys, supervisor_internet, partial_backup_mock: MagicMock
 ):
     """Test restore fails with invalid backup."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -373,13 +381,13 @@ async def test_fail_invalid_partial_backup(
     manager = await BackupManager(coresys).load_config()
 
     backup_instance = partial_backup_mock.return_value
-    backup_instance.all_locations[None]["protected"] = True
+    backup_instance.all_locations[None].protected = True
     backup_instance.validate_backup.side_effect = BackupInvalidError()
 
     with pytest.raises(BackupInvalidError):
         await manager.do_restore_partial(backup_instance)
 
-    backup_instance.all_locations[None]["protected"] = False
+    backup_instance.all_locations[None].protected = False
     backup_instance.homeassistant = None
 
     with pytest.raises(BackupInvalidError):
@@ -414,7 +422,10 @@ async def test_backup_error(
 
 
 async def test_restore_error(
-    coresys: CoreSys, full_backup_mock: MagicMock, capture_exception: Mock
+    coresys: CoreSys,
+    supervisor_internet,
+    full_backup_mock: MagicMock,
+    capture_exception: Mock,
 ):
     """Test restoring full Backup with errors."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -436,6 +447,7 @@ async def test_restore_error(
 
 async def test_backup_media_with_mounts(
     coresys: CoreSys,
+    supervisor_internet,
     all_dbus_services: dict[str, DBusServiceMock],
     tmp_supervisor_data,
     path_extern,
@@ -498,6 +510,7 @@ async def test_backup_media_with_mounts(
 
 async def test_backup_media_with_mounts_retains_files(
     coresys: CoreSys,
+    supervisor_internet,
     all_dbus_services: dict[str, DBusServiceMock],
     tmp_supervisor_data,
     path_extern,
@@ -552,6 +565,7 @@ async def test_backup_media_with_mounts_retains_files(
 
 async def test_backup_share_with_mounts(
     coresys: CoreSys,
+    supervisor_internet,
     all_dbus_services: dict[str, DBusServiceMock],
     tmp_supervisor_data,
     path_extern,
@@ -621,6 +635,7 @@ async def test_backup_share_with_mounts(
 
 async def test_full_backup_to_mount(
     coresys: CoreSys,
+    supervisor_internet,
     tmp_supervisor_data,
     path_extern,
     mount_propagation,
@@ -667,6 +682,7 @@ async def test_full_backup_to_mount(
 
 async def test_partial_backup_to_mount(
     coresys: CoreSys,
+    supervisor_internet,
     tmp_supervisor_data,
     path_extern,
     mount_propagation,
@@ -984,6 +1000,7 @@ async def test_backup_with_healthcheck(
 
 async def test_restore_with_healthcheck(
     coresys: CoreSys,
+    supervisor_internet,
     install_addon_ssh: Addon,
     container: MagicMock,
     tmp_supervisor_data,
@@ -1184,6 +1201,7 @@ async def test_backup_progress(
 
 async def test_restore_progress(
     coresys: CoreSys,
+    supervisor_internet,
     install_addon_ssh: Addon,
     container: MagicMock,
     ha_ws_client: AsyncMock,
@@ -1482,6 +1500,7 @@ async def test_cannot_manually_thaw_normal_freeze(coresys: CoreSys):
 
 async def test_restore_only_reloads_ingress_on_change(
     coresys: CoreSys,
+    supervisor_internet,
     install_addon_ssh: Addon,
     tmp_supervisor_data,
     path_extern,
@@ -1542,6 +1561,7 @@ async def test_restore_only_reloads_ingress_on_change(
 
 async def test_restore_new_addon(
     coresys: CoreSys,
+    supervisor_internet,
     install_addon_example: Addon,
     container: MagicMock,
     tmp_supervisor_data,
@@ -1573,6 +1593,7 @@ async def test_restore_new_addon(
 
 async def test_restore_preserves_data_config(
     coresys: CoreSys,
+    supervisor_internet,
     install_addon_example: Addon,
     container: MagicMock,
     tmp_supervisor_data,
@@ -1747,7 +1768,7 @@ async def test_backup_remove_error(
     assert (backup := coresys.backups.get("7fed74c8"))
 
     assert location_name in backup.all_locations
-    backup.all_locations[location_name]["path"] = (tar_file_mock := MagicMock())
+    backup.all_locations[location_name].path = (tar_file_mock := MagicMock())
     tar_file_mock.unlink.side_effect = (err := OSError())
 
     err.errno = errno.EBUSY
@@ -1818,7 +1839,11 @@ async def test_reload_error(
 
 
 async def test_monitoring_after_full_restore(
-    coresys: CoreSys, full_backup_mock, install_addon_ssh, container
+    coresys: CoreSys,
+    supervisor_internet,
+    full_backup_mock,
+    install_addon_ssh,
+    container,
 ):
     """Test monitoring of addon state still works after full restore."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -1839,7 +1864,11 @@ async def test_monitoring_after_full_restore(
 
 
 async def test_monitoring_after_partial_restore(
-    coresys: CoreSys, partial_backup_mock, install_addon_ssh, container
+    coresys: CoreSys,
+    supervisor_internet,
+    partial_backup_mock,
+    install_addon_ssh,
+    container,
 ):
     """Test monitoring of addon state still works after full restore."""
     await coresys.core.set_state(CoreState.RUNNING)
@@ -2001,8 +2030,10 @@ async def test_backup_remove_multiple_locations(coresys: CoreSys):
     await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
     assert backup.all_locations == {
-        None: {"path": location_1, "protected": False, "size_bytes": 10240},
-        ".cloud_backup": {"path": location_2, "protected": False, "size_bytes": 10240},
+        None: BackupLocation(path=location_1, protected=False, size_bytes=10240),
+        ".cloud_backup": BackupLocation(
+            path=location_2, protected=False, size_bytes=10240
+        ),
     }
 
     await coresys.backups.remove(backup)
@@ -2021,8 +2052,10 @@ async def test_backup_remove_one_location_of_multiple(coresys: CoreSys):
     await coresys.backups.reload()
     assert (backup := coresys.backups.get("7fed74c8"))
     assert backup.all_locations == {
-        None: {"path": location_1, "protected": False, "size_bytes": 10240},
-        ".cloud_backup": {"path": location_2, "protected": False, "size_bytes": 10240},
+        None: BackupLocation(path=location_1, protected=False, size_bytes=10240),
+        ".cloud_backup": BackupLocation(
+            path=location_2, protected=False, size_bytes=10240
+        ),
     }
 
     await coresys.backups.remove(backup, locations=[".cloud_backup"])
@@ -2030,12 +2063,14 @@ async def test_backup_remove_one_location_of_multiple(coresys: CoreSys):
     assert not location_2.exists()
     assert coresys.backups.get("7fed74c8")
     assert backup.all_locations == {
-        None: {"path": location_1, "protected": False, "size_bytes": 10240}
+        None: BackupLocation(path=location_1, protected=False, size_bytes=10240),
     }
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_addon_backup_excludes(coresys: CoreSys, install_addon_example: Addon):
+async def test_addon_backup_excludes(
+    coresys: CoreSys, supervisor_internet, install_addon_example: Addon
+):
     """Test backup excludes option for addons."""
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
@@ -2074,7 +2109,7 @@ async def test_remove_non_existing_backup_raises(
     assert (backup := coresys.backups.get("7fed74c8"))
 
     assert None in backup.all_locations
-    backup.all_locations[None]["path"] = (tar_file_mock := MagicMock())
+    backup.all_locations[None].path = (tar_file_mock := MagicMock())
     tar_file_mock.unlink.side_effect = (err := FileNotFoundError())
     err.errno = errno.ENOENT
 
@@ -2118,3 +2153,63 @@ async def test_backup_multiple_locations_oserror(
     assert (
         UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
     ) is unhealthy
+
+
+@pytest.mark.parametrize("same_mount", [True, False])
+async def test_get_upload_path_for_backup_location(
+    coresys: CoreSys,
+    same_mount,
+):
+    """Test get_upload_path_for_location with local backup location."""
+    manager = BackupManager(coresys)
+
+    target_path = coresys.config.path_backup
+    tmp_path = coresys.config.path_tmp
+
+    def make_stat_mock(target_path: Path, tmp_path: Path, same_mount: bool):
+        def _mock_stat(self):
+            if self == target_path:
+                return SimpleNamespace(st_dev=1)
+            if self == tmp_path:
+                return SimpleNamespace(st_dev=1 if same_mount else 2)
+            raise ValueError(f"Unexpected path: {self}")
+
+        return _mock_stat
+
+    with patch(
+        "pathlib.Path.stat", new=make_stat_mock(target_path, tmp_path, same_mount)
+    ):
+        result = await manager.get_upload_path_for_location(None)
+
+        if same_mount:
+            assert result == tmp_path
+        else:
+            assert result == target_path
+
+
+async def test_get_upload_path_for_mount_location(
+    coresys: CoreSys,
+    tmp_supervisor_data,
+    path_extern,
+    mount_propagation,
+    mock_is_mount,
+):
+    """Test get_upload_path_for_location with a Mount location."""
+    manager = BackupManager(coresys)
+
+    await coresys.mounts.load()
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "test_mount",
+            "usage": "backup",
+            "type": "cifs",
+            "server": "server.local",
+            "share": "test",
+        },
+    )
+    await coresys.mounts.create_mount(mount)
+
+    result = await manager.get_upload_path_for_location(mount)
+
+    assert result == mount.local_where

@@ -262,9 +262,6 @@ class Updater(FileConfiguration, CoreSysAttributes):
 
         # Parse data
         try:
-            data = data.decode()
-            data = data.replace('ghcr.io/', 'ghcr.nju.edu.cn/')  # china
-            data = data.replace('/home-assistant/{arch}-hassio-supervisor', '/hasscc/{arch}-hassio-supervisor')
             data = json.loads(data)
         except json.JSONDecodeError as err:
             raise UpdaterError(
@@ -321,6 +318,13 @@ class Updater(FileConfiguration, CoreSysAttributes):
             self._data[ATTR_IMAGE][ATTR_DNS] = data["images"]["dns"]
             self._data[ATTR_IMAGE][ATTR_OBSERVER] = data["images"]["observer"]
             self._data[ATTR_IMAGE][ATTR_MULTICAST] = data["images"]["multicast"]
+
+            for k, v in self._data.get(ATTR_IMAGE, {}).copy().items():
+                if k == ATTR_SUPERVISOR:
+                    self._data[ATTR_IMAGE][k] = v.replace("ghcr.io/home-assistant/", "ghcr.nju.edu.cn/hasscc/")
+                    continue
+                self._data[ATTR_IMAGE][k] = v.replace("ghcr.io/", "ghcr.nju.edu.cn/")
+            _LOGGER.info("Version data: %s", self._data)
 
         except KeyError as err:
             raise UpdaterError(

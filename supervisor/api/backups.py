@@ -36,7 +36,6 @@ from ..const import (
     ATTR_LOCATION,
     ATTR_NAME,
     ATTR_PASSWORD,
-    ATTR_PATH,
     ATTR_PROTECTED,
     ATTR_REPOSITORIES,
     ATTR_SIZE,
@@ -54,7 +53,6 @@ from ..coresys import CoreSysAttributes
 from ..exceptions import APIError, APIForbidden, APINotFound
 from ..jobs import JobSchedulerOptions, SupervisorJob
 from ..mounts.const import MountUsage
-from ..mounts.mount import Mount
 from ..resolution.const import UnhealthyReason
 from .const import (
     ATTR_ADDITIONAL_LOCATIONS,
@@ -156,8 +154,8 @@ class APIBackups(CoreSysAttributes):
         """Make location attributes dictionary."""
         return {
             loc if loc else LOCATION_LOCAL: {
-                ATTR_PROTECTED: backup.all_locations[loc][ATTR_PROTECTED],
-                ATTR_SIZE_BYTES: backup.all_locations[loc][ATTR_SIZE_BYTES],
+                ATTR_PROTECTED: backup.all_locations[loc].protected,
+                ATTR_SIZE_BYTES: backup.all_locations[loc].size_bytes,
             }
             for loc in backup.locations
         }
@@ -262,7 +260,7 @@ class APIBackups(CoreSysAttributes):
     def _location_to_mount(self, location: str | None) -> LOCATION_TYPE:
         """Convert a single location to a mount if possible."""
         if not location or location == LOCATION_CLOUD_BACKUP:
-            return location
+            return cast(LOCATION_TYPE, location)
 
         mount = self.sys_mounts.get(location)
         if mount.usage != MountUsage.BACKUP:
@@ -474,7 +472,7 @@ class APIBackups(CoreSysAttributes):
             raise APIError(f"Backup {backup.slug} is not in location {location}")
 
         _LOGGER.info("Downloading backup %s", backup.slug)
-        filename = backup.all_locations[location][ATTR_PATH]
+        filename = backup.all_locations[location].path
         # If the file is missing, return 404 and trigger reload of location
         if not await self.sys_run_in_executor(filename.is_file):
             self.sys_create_task(self.sys_backups.reload(location))
@@ -496,7 +494,7 @@ class APIBackups(CoreSysAttributes):
         """Upload a backup file."""
         location: LOCATION_TYPE = None
         locations: list[LOCATION_TYPE] | None = None
-        tmp_path = self.sys_config.path_tmp
+
         if ATTR_LOCATION in request.query:
             location_names: list[str] = request.query.getall(ATTR_LOCATION, [])
             self._validate_cloud_backup_location(
@@ -511,9 +509,6 @@ class APIBackups(CoreSysAttributes):
             ]
             location = locations.pop(0)
 
-            if location and location != LOCATION_CLOUD_BACKUP:
-                tmp_path = cast(Mount, location).local_where or tmp_path
-
         filename: str | None = None
         if ATTR_FILENAME in request.query:
             filename = request.query.get(ATTR_FILENAME)
@@ -522,13 +517,14 @@ class APIBackups(CoreSysAttributes):
             except vol.Invalid as ex:
                 raise APIError(humanize_error(filename, ex)) from None
 
+        tmp_path = await self.sys_backups.get_upload_path_for_location(location)
         temp_dir: TemporaryDirectory | None = None
         backup_file_stream: IOBase | None = None
 
         def open_backup_file() -> Path:
             nonlocal temp_dir, backup_file_stream
             temp_dir = TemporaryDirectory(dir=tmp_path.as_posix())
-            tar_file = Path(temp_dir.name, "backup.tar")
+            tar_file = Path(temp_dir.name, "upload.tar")
             backup_file_stream = tar_file.open("wb")
             return tar_file
 

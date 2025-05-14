@@ -5,7 +5,7 @@ from contextlib import suppress
 import logging
 from typing import Any
 
-from aiohttp import ClientConnectionResetError, web
+from aiohttp import ClientConnectionResetError, ClientPayloadError, web
 from aiohttp.hdrs import ACCEPT, RANGE
 import voluptuous as vol
 from voluptuous.error import CoerceInvalid
@@ -37,6 +37,7 @@ from ..host.const import (
     LogFormat,
     LogFormatter,
 )
+from ..host.logs import SYSTEMD_JOURNAL_GATEWAYD_LINES_MAX
 from ..utils.systemd_journal import journal_logs_reader
 from .const import (
     ATTR_AGENT_VERSION,
@@ -238,13 +239,11 @@ class APIHost(CoreSysAttributes):
                 # return 2 lines at minimum.
                 lines = max(2, lines)
             # entries=cursor[[:num_skip]:num_entries]
-            range_header = f"entries=:-{lines - 1}:{'' if follow else lines}"
+            range_header = f"entries=:-{lines - 1}:{SYSTEMD_JOURNAL_GATEWAYD_LINES_MAX if follow else lines}"
         elif RANGE in request.headers:
             range_header = request.headers[RANGE]
         else:
-            range_header = (
-                f"entries=:-{DEFAULT_LINES - 1}:{'' if follow else DEFAULT_LINES}"
-            )
+            range_header = f"entries=:-{DEFAULT_LINES - 1}:{SYSTEMD_JOURNAL_GATEWAYD_LINES_MAX if follow else DEFAULT_LINES}"
 
         async with self.sys_host.logs.journald_logs(
             params=params, range_header=range_header, accept=LogFormat.JOURNAL
@@ -270,7 +269,8 @@ class APIHost(CoreSysAttributes):
                             err,
                         )
                         break
-            except ConnectionResetError as ex:
+            except (ConnectionResetError, ClientPayloadError) as ex:
+                # ClientPayloadError is most likely caused by the closing the connection
                 raise APIError(
                     "Connection reset when trying to fetch data from systemd-journald."
                 ) from ex

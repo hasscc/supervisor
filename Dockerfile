@@ -33,7 +33,7 @@ RUN \
     && if [[ "${BUILD_VERSION}" == *"frozen"* ]]; then \
         curl -Lso /etc/hassio-version.json https://version.home-assistant.io/stable.json; \
     fi \
-    && pip3 install uv==0.6.1
+    && pip3 install uv==0.6.17
 
 # Install requirements
 COPY requirements.txt .

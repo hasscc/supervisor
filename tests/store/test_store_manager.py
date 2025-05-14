@@ -228,7 +228,7 @@ async def test_install_unavailable_addon(
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_reload(coresys: CoreSys):
+async def test_reload(coresys: CoreSys, supervisor_internet):
     """Test store reload."""
     await coresys.store.load()
     assert len(coresys.store.all) == 5
@@ -250,5 +250,8 @@ async def test_addon_version_timestamp(coresys: CoreSys, install_addon_example: 
 
     # If a new version is seen processing repo, reset to utc now
     install_addon_example.data_store["version"] = "1.1.0"
-    await coresys.store.reload()
-    assert timestamp < install_addon_example.latest_version_timestamp
+
+    # Signal the store repositories got updated
+    with patch("supervisor.store.repository.Repository.update", return_value=True):
+        await coresys.store.reload()
+        assert timestamp < install_addon_example.latest_version_timestamp
