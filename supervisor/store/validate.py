@@ -16,6 +16,7 @@ BUILTIN_REPOSITORIES = {
     URL_ESPHOME,
     URL_MUSIC_ASSISTANT,
     "https://gitee.com/hacs-china/addons",
+    "https://gitee.com/hasscc/addons",
     "https://gitee.com/desmond_GT/hassio-addons",
 }
 
