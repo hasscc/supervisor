@@ -18,6 +18,7 @@ from supervisor.const import AddonBoot, AddonState, BusEvent
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.const import ContainerState
+from supervisor.docker.manager import CommandReturn
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import AddonsError, AddonsJobError, AudioUpdateError
 from supervisor.hardware.helper import HwHelper
@@ -27,7 +28,7 @@ from supervisor.utils.dt import utcnow
 
 from .test_manager import BOOT_FAIL_ISSUE, BOOT_FAIL_SUGGESTIONS
 
-from tests.common import get_fixture_path
+from tests.common import get_fixture_path, is_in_list
 from tests.const import TEST_ADDON_SLUG
 
 
@@ -208,7 +209,7 @@ async def test_watchdog_on_stop(coresys: CoreSys, install_addon_ssh: Addon) -> N
 
 
 async def test_listener_attached_on_install(
-    coresys: CoreSys, mock_amd64_arch_supported: None, repository
+    coresys: CoreSys, mock_amd64_arch_supported: None, test_repository
 ):
     """Test events listener attached on addon install."""
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
@@ -241,7 +242,7 @@ async def test_listener_attached_on_install(
 )
 async def test_watchdog_during_attach(
     coresys: CoreSys,
-    repository: Repository,
+    test_repository: Repository,
     boot_timedelta: timedelta,
     restart_count: int,
 ):
@@ -709,7 +710,7 @@ async def test_local_example_install(
     coresys: CoreSys,
     container: MagicMock,
     tmp_supervisor_data: Path,
-    repository,
+    test_repository,
     mock_aarch64_arch_supported: None,
 ):
     """Test install of an addon."""
@@ -819,7 +820,7 @@ async def test_paths_cache(coresys: CoreSys, install_addon_ssh: Addon):
 
     with (
         patch("supervisor.addons.addon.Path.exists", return_value=True),
-        patch("supervisor.store.repository.Repository.update", return_value=True),
+        patch("supervisor.store.repository.RepositoryLocal.update", return_value=True),
     ):
         await coresys.store.reload(coresys.store.get("local"))
 
@@ -840,10 +841,25 @@ async def test_addon_loads_wrong_image(
     install_addon_ssh.persist["image"] = "local/aarch64-addon-ssh"
     assert install_addon_ssh.image == "local/aarch64-addon-ssh"
 
-    with patch("pathlib.Path.is_file", return_value=True):
+    with (
+        patch("pathlib.Path.is_file", return_value=True),
+        patch.object(
+            coresys.docker,
+            "run_command",
+            new=PropertyMock(return_value=CommandReturn(0, b"Build successful")),
+        ) as mock_run_command,
+        patch.object(
+            type(coresys.config),
+            "local_to_extern_path",
+            return_value="/addon/path/on/host",
+        ),
+    ):
         await install_addon_ssh.load()
 
-    container.remove.assert_called_once_with(force=True)
+    container.remove.assert_called_with(force=True, v=True)
+    # one for removing the addon, one for removing the addon builder
+    assert coresys.docker.images.remove.call_count == 2
+
     assert coresys.docker.images.remove.call_args_list[0].kwargs == {
         "image": "local/aarch64-addon-ssh:latest",
         "force": True,
@@ -852,12 +868,18 @@ async def test_addon_loads_wrong_image(
         "image": "local/aarch64-addon-ssh:9.2.1",
         "force": True,
     }
-    coresys.docker.images.build.assert_called_once()
-    assert (
-        coresys.docker.images.build.call_args.kwargs["tag"]
-        == "local/amd64-addon-ssh:9.2.1"
+    mock_run_command.assert_called_once()
+    assert mock_run_command.call_args.args[0] == "docker.io/library/docker"
+    assert mock_run_command.call_args.kwargs["version"] == "1.0.0-cli"
+    command = mock_run_command.call_args.kwargs["command"]
+    assert is_in_list(
+        ["--platform", "linux/amd64"],
+        command,
     )
-    assert coresys.docker.images.build.call_args.kwargs["platform"] == "linux/amd64"
+    assert is_in_list(
+        ["--tag", "local/amd64-addon-ssh:9.2.1"],
+        command,
+    )
     assert install_addon_ssh.image == "local/amd64-addon-ssh"
     coresys.addons.data.save_data.assert_called_once()
 
@@ -871,15 +893,33 @@ async def test_addon_loads_missing_image(
     """Test addon corrects a missing image on load."""
     coresys.docker.images.get.side_effect = ImageNotFound("missing")
 
-    with patch("pathlib.Path.is_file", return_value=True):
+    with (
+        patch("pathlib.Path.is_file", return_value=True),
+        patch.object(
+            coresys.docker,
+            "run_command",
+            new=PropertyMock(return_value=CommandReturn(0, b"Build successful")),
+        ) as mock_run_command,
+        patch.object(
+            type(coresys.config),
+            "local_to_extern_path",
+            return_value="/addon/path/on/host",
+        ),
+    ):
         await install_addon_ssh.load()
 
-    coresys.docker.images.build.assert_called_once()
-    assert (
-        coresys.docker.images.build.call_args.kwargs["tag"]
-        == "local/amd64-addon-ssh:9.2.1"
+    mock_run_command.assert_called_once()
+    assert mock_run_command.call_args.args[0] == "docker.io/library/docker"
+    assert mock_run_command.call_args.kwargs["version"] == "1.0.0-cli"
+    command = mock_run_command.call_args.kwargs["command"]
+    assert is_in_list(
+        ["--platform", "linux/amd64"],
+        command,
     )
-    assert coresys.docker.images.build.call_args.kwargs["platform"] == "linux/amd64"
+    assert is_in_list(
+        ["--tag", "local/amd64-addon-ssh:9.2.1"],
+        command,
+    )
     assert install_addon_ssh.image == "local/amd64-addon-ssh"
 
 
@@ -900,7 +940,14 @@ async def test_addon_load_succeeds_with_docker_errors(
     # Image build failure
     coresys.docker.images.build.side_effect = DockerException()
     caplog.clear()
-    with patch("pathlib.Path.is_file", return_value=True):
+    with (
+        patch("pathlib.Path.is_file", return_value=True),
+        patch.object(
+            type(coresys.config),
+            "local_to_extern_path",
+            return_value="/addon/path/on/host",
+        ),
+    ):
         await install_addon_ssh.load()
     assert "Can't build local/amd64-addon-ssh:9.2.1" in caplog.text
 

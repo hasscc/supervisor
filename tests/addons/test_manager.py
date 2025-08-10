@@ -29,7 +29,7 @@ from supervisor.plugins.dns import PluginDns
 from supervisor.resolution.const import ContextType, IssueType, SuggestionType
 from supervisor.resolution.data import Issue, Suggestion
 from supervisor.store.addon import AddonStore
-from supervisor.store.repository import Repository
+from supervisor.store.repository import RepositoryLocal
 from supervisor.utils import check_exception_chain
 from supervisor.utils.common import write_json_file
 
@@ -67,7 +67,7 @@ async def fixture_remove_wait_boot(coresys: CoreSys) -> AsyncGenerator[None]:
 
 @pytest.fixture(name="install_addon_example_image")
 async def fixture_install_addon_example_image(
-    coresys: CoreSys, repository
+    coresys: CoreSys, test_repository
 ) -> Generator[Addon]:
     """Install local_example add-on with image."""
     store = coresys.addons.store["local_example_image"]
@@ -442,7 +442,7 @@ async def test_store_data_changes_during_update(
     update_task = coresys.create_task(simulate_update())
     await asyncio.sleep(0)
 
-    with patch.object(Repository, "update", return_value=True):
+    with patch.object(RepositoryLocal, "update", return_value=True):
         await coresys.store.reload()
 
     assert "image" not in coresys.store.data.addons["local_ssh"]
