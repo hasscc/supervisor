@@ -22,9 +22,13 @@ class BuiltinRepository(StrEnum):
 
     # Git-based built-in repositories
     CORE = REPOSITORY_CORE
-    COMMUNITY_ADDONS = "https://github.com/hassio-addons/repository"
-    ESPHOME = "https://github.com/esphome/home-assistant-addon"
-    MUSIC_ASSISTANT = "https://github.com/music-assistant/home-assistant-addon"
+    COMMUNITY_ADDONS = "https://gitee.com/hassio/addons"
+    ESPHOME = "https://gitee.com/hassio/esphome-addon"
+    MUSIC_ASSISTANT = "https://gitee.com/hassio/music-assistant-addon"
+
+    HACS_CHINA = "https://gitee.com/hacs-china/addons"
+    HASSCC = "https://gitee.com/hasscc/addons"
+    DESMOND = "https://gitee.com/desmond_GT/hassio-addons"
 
     @property
     def git_url(self) -> str:
