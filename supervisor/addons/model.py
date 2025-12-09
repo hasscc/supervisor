@@ -72,6 +72,7 @@ from ..const import (
     ATTR_TYPE,
     ATTR_UART,
     ATTR_UDEV,
+    ATTR_ULIMITS,
     ATTR_URL,
     ATTR_USB,
     ATTR_VERSION,
@@ -102,7 +103,6 @@ from .configuration import FolderMapping
 from .const import (
     ATTR_BACKUP,
     ATTR_BREAKING_VERSIONS,
-    ATTR_CODENOTARY,
     ATTR_PATH,
     ATTR_READ_ONLY,
     AddonBackupMode,
@@ -463,6 +463,11 @@ class AddonModel(JobGroup, ABC):
         return self.data[ATTR_UDEV]
 
     @property
+    def ulimits(self) -> dict[str, Any]:
+        """Return ulimits configuration."""
+        return self.data[ATTR_ULIMITS]
+
+    @property
     def with_kernel_modules(self) -> bool:
         """Return True if the add-on access to kernel modules."""
         return self.data[ATTR_KERNEL_MODULES]
@@ -626,13 +631,8 @@ class AddonModel(JobGroup, ABC):
 
     @property
     def signed(self) -> bool:
-        """Return True if the image is signed."""
-        return ATTR_CODENOTARY in self.data
-
-    @property
-    def codenotary(self) -> str | None:
-        """Return Signer email address for CAS."""
-        return self.data.get(ATTR_CODENOTARY)
+        """Currently no signing support."""
+        return False
 
     @property
     def breaking_versions(self) -> list[AwesomeVersion]:

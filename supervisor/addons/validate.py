@@ -88,6 +88,7 @@ from ..const import (
     ATTR_TYPE,
     ATTR_UART,
     ATTR_UDEV,
+    ATTR_ULIMITS,
     ATTR_URL,
     ATTR_USB,
     ATTR_USER,
@@ -203,6 +204,12 @@ def _warn_addon_config(config: dict[str, Any]):
     ):
         _LOGGER.warning(
             "Add-on which only support COLD backups trying to use post/pre commands. Please report this to the maintainer of %s",
+            name,
+        )
+
+    if ATTR_CODENOTARY in config:
+        _LOGGER.warning(
+            "Add-on '%s' uses deprecated 'codenotary' field in config. This field is no longer used and will be ignored. Please report this to the maintainer.",
             name,
         )
 
@@ -416,13 +423,26 @@ _SCHEMA_ADDON_CONFIG = vol.Schema(
         vol.Optional(ATTR_BACKUP, default=AddonBackupMode.HOT): vol.Coerce(
             AddonBackupMode
         ),
-        vol.Optional(ATTR_CODENOTARY): vol.Email(),
         vol.Optional(ATTR_OPTIONS, default={}): dict,
         vol.Optional(ATTR_SCHEMA, default={}): vol.Any(
             vol.Schema({str: SCHEMA_ELEMENT}),
             False,
         ),
         vol.Optional(ATTR_IMAGE): docker_image,
+        vol.Optional(ATTR_ULIMITS, default=dict): vol.Any(
+            {str: vol.Coerce(int)},  # Simple format: {name: limit}
+            {
+                str: vol.Any(
+                    vol.Coerce(int),  # Simple format for individual entries
+                    vol.Schema(
+                        {  # Detailed format for individual entries
+                            vol.Required("soft"): vol.Coerce(int),
+                            vol.Required("hard"): vol.Coerce(int),
+                        }
+                    ),
+                )
+            },
+        ),
         vol.Optional(ATTR_TIMEOUT, default=10): vol.All(
             vol.Coerce(int), vol.Range(min=10, max=300)
         ),

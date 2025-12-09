@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, PropertyMock, call, patch
 
+import aiodocker
 from awesomeversion import AwesomeVersion
 from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
-from docker.models.images import Image
 import pytest
 from requests import RequestException
 
@@ -26,19 +26,9 @@ from supervisor.exceptions import (
     DockerNotFound,
     DockerRequestError,
 )
-from supervisor.homeassistant.const import WSEvent
 from supervisor.jobs import JobSchedulerOptions, SupervisorJob
 
-from tests.common import load_json_fixture
-
-
-@pytest.fixture(autouse=True)
-def mock_verify_content(coresys: CoreSys):
-    """Mock verify_content utility during tests."""
-    with patch.object(
-        coresys.security, "verify_content", return_value=None
-    ) as verify_content:
-        yield verify_content
+from tests.common import AsyncIterator, load_json_fixture
 
 
 @pytest.mark.parametrize(
@@ -58,35 +48,30 @@ async def test_docker_image_platform(
     platform: str,
 ):
     """Test platform set correctly from arch."""
-    with patch.object(
-        coresys.docker.images, "get", return_value=Mock(id="test:1.2.3")
-    ) as get:
-        await test_docker_interface.install(
-            AwesomeVersion("1.2.3"), "test", arch=cpu_arch
-        )
-        coresys.docker.docker.api.pull.assert_called_once_with(
-            "test", tag="1.2.3", platform=platform, stream=True, decode=True
-        )
-        get.assert_called_once_with("test:1.2.3")
+    coresys.docker.images.inspect.return_value = {"Id": "test:1.2.3"}
+    await test_docker_interface.install(AwesomeVersion("1.2.3"), "test", arch=cpu_arch)
+    coresys.docker.images.pull.assert_called_once_with(
+        "test", tag="1.2.3", platform=platform, stream=True
+    )
+    coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
 
 async def test_docker_image_default_platform(
     coresys: CoreSys, test_docker_interface: DockerInterface
 ):
     """Test platform set using supervisor arch when omitted."""
+    coresys.docker.images.inspect.return_value = {"Id": "test:1.2.3"}
     with (
         patch.object(
             type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
         ),
-        patch.object(
-            coresys.docker.images, "get", return_value=Mock(id="test:1.2.3")
-        ) as get,
     ):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
-        coresys.docker.docker.api.pull.assert_called_once_with(
-            "test", tag="1.2.3", platform="linux/386", stream=True, decode=True
+        coresys.docker.images.pull.assert_called_once_with(
+            "test", tag="1.2.3", platform="linux/386", stream=True
         )
-        get.assert_called_once_with("test:1.2.3")
+
+    coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
 
 @pytest.mark.parametrize(
@@ -217,57 +202,40 @@ async def test_attach_existing_container(
 
 async def test_attach_container_failure(coresys: CoreSys):
     """Test attach fails to find container but finds image."""
-    container_collection = MagicMock()
-    container_collection.get.side_effect = DockerException()
-    image_collection = MagicMock()
-    image_config = {"Image": "sha256:abc123"}
-    image_collection.get.return_value = Image({"Config": image_config})
-    with (
-        patch(
-            "supervisor.docker.manager.DockerAPI.containers",
-            new=PropertyMock(return_value=container_collection),
-        ),
-        patch(
-            "supervisor.docker.manager.DockerAPI.images",
-            new=PropertyMock(return_value=image_collection),
-        ),
-        patch.object(type(coresys.bus), "fire_event") as fire_event,
-    ):
+    coresys.docker.containers.get.side_effect = DockerException()
+    coresys.docker.images.inspect.return_value.setdefault("Config", {})["Image"] = (
+        "sha256:abc123"
+    )
+    with patch.object(type(coresys.bus), "fire_event") as fire_event:
         await coresys.homeassistant.core.instance.attach(AwesomeVersion("2022.7.3"))
         assert not [
             event
             for event in fire_event.call_args_list
             if event.args[0] == BusEvent.DOCKER_CONTAINER_STATE_CHANGE
         ]
-        assert coresys.homeassistant.core.instance.meta_config == image_config
+        assert (
+            coresys.homeassistant.core.instance.meta_config["Image"] == "sha256:abc123"
+        )
 
 
 async def test_attach_total_failure(coresys: CoreSys):
     """Test attach fails to find container or image."""
-    container_collection = MagicMock()
-    container_collection.get.side_effect = DockerException()
-    image_collection = MagicMock()
-    image_collection.get.side_effect = DockerException()
-    with (
-        patch(
-            "supervisor.docker.manager.DockerAPI.containers",
-            new=PropertyMock(return_value=container_collection),
-        ),
-        patch(
-            "supervisor.docker.manager.DockerAPI.images",
-            new=PropertyMock(return_value=image_collection),
-        ),
-        pytest.raises(DockerError),
-    ):
+    coresys.docker.containers.get.side_effect = DockerException
+    coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
+        400, {"message": ""}
+    )
+    with pytest.raises(DockerError):
         await coresys.homeassistant.core.instance.attach(AwesomeVersion("2022.7.3"))
 
 
-@pytest.mark.parametrize("err", [DockerException(), RequestException()])
+@pytest.mark.parametrize(
+    "err", [aiodocker.DockerError(400, {"message": ""}), RequestException()]
+)
 async def test_image_pull_fail(
     coresys: CoreSys, capture_exception: Mock, err: Exception
 ):
     """Test failure to pull image."""
-    coresys.docker.images.get.side_effect = err
+    coresys.docker.images.inspect.side_effect = err
     with pytest.raises(DockerError):
         await coresys.homeassistant.core.instance.install(
             AwesomeVersion("2022.7.3"), arch=CpuArch.AMD64
@@ -299,8 +267,9 @@ async def test_install_fires_progress_events(
     coresys: CoreSys, test_docker_interface: DockerInterface
 ):
     """Test progress events are fired during an install for listeners."""
+
     # This is from a sample pull. Filtered log to just one per unique status for test
-    coresys.docker.docker.api.pull.return_value = [
+    logs = [
         {
             "status": "Pulling from home-assistant/odroid-n2-homeassistant",
             "id": "2025.7.2",
@@ -322,7 +291,11 @@ async def test_install_fires_progress_events(
             "id": "1578b14a573c",
         },
         {"status": "Pull complete", "progressDetail": {}, "id": "1578b14a573c"},
-        {"status": "Verifying Checksum", "progressDetail": {}, "id": "6a1e931d8f88"},
+        {
+            "status": "Verifying Checksum",
+            "progressDetail": {},
+            "id": "6a1e931d8f88",
+        },
         {
             "status": "Digest: sha256:490080d7da0f385928022927990e04f604615f7b8c622ef3e58253d0f089881d"
         },
@@ -330,6 +303,7 @@ async def test_install_fires_progress_events(
             "status": "Status: Downloaded newer image for ghcr.io/home-assistant/odroid-n2-homeassistant:2025.7.2"
         },
     ]
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
 
     events: list[PullLogEntry] = []
 
@@ -344,10 +318,10 @@ async def test_install_fires_progress_events(
         ),
     ):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
-        coresys.docker.docker.api.pull.assert_called_once_with(
-            "test", tag="1.2.3", platform="linux/386", stream=True, decode=True
+        coresys.docker.images.pull.assert_called_once_with(
+            "test", tag="1.2.3", platform="linux/386", stream=True
         )
-        coresys.docker.images.get.assert_called_once_with("test:1.2.3")
+        coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
     await asyncio.sleep(1)
     assert events == [
@@ -417,197 +391,19 @@ async def test_install_fires_progress_events(
     ]
 
 
-async def test_install_sends_progress_to_home_assistant(
-    coresys: CoreSys, test_docker_interface: DockerInterface, ha_ws_client: AsyncMock
-):
-    """Test progress events are sent as job updates to Home Assistant."""
-    coresys.core.set_state(CoreState.RUNNING)
-    coresys.docker.docker.api.pull.return_value = load_json_fixture(
-        "docker_pull_image_log.json"
-    )
-
-    with (
-        patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
-        ),
-    ):
-        # Schedule job so we can listen for the end. Then we can assert against the WS mock
-        event = asyncio.Event()
-        job, install_task = coresys.jobs.schedule_job(
-            test_docker_interface.install,
-            JobSchedulerOptions(),
-            AwesomeVersion("1.2.3"),
-            "test",
-        )
-
-        async def listen_for_job_end(reference: SupervisorJob):
-            if reference.uuid != job.uuid:
-                return
-            event.set()
-
-        coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_END, listen_for_job_end)
-        await install_task
-        await event.wait()
-
-    events = [
-        evt.args[0]["data"]["data"]
-        for evt in ha_ws_client.async_send_command.call_args_list
-        if "data" in evt.args[0] and evt.args[0]["data"]["event"] == WSEvent.JOB
-    ]
-    assert events[0]["name"] == "docker_interface_install"
-    assert events[0]["uuid"] == job.uuid
-    assert events[0]["done"] is None
-    assert events[1]["name"] == "docker_interface_install"
-    assert events[1]["uuid"] == job.uuid
-    assert events[1]["done"] is False
-    assert events[-1]["name"] == "docker_interface_install"
-    assert events[-1]["uuid"] == job.uuid
-    assert events[-1]["done"] is True
-
-    def make_sub_log(layer_id: str):
-        return [
-            {
-                "stage": evt["stage"],
-                "progress": evt["progress"],
-                "done": evt["done"],
-                "extra": evt["extra"],
-            }
-            for evt in events
-            if evt["name"] == "Pulling container image layer"
-            and evt["reference"] == layer_id
-            and evt["parent_id"] == job.uuid
-        ]
-
-    layer_1_log = make_sub_log("1e214cd6d7d0")
-    layer_2_log = make_sub_log("1a38e1d5e18d")
-    assert len(layer_1_log) == 20
-    assert len(layer_2_log) == 19
-    assert len(events) == 42
-    assert layer_1_log == [
-        {"stage": "Pulling fs layer", "progress": 0, "done": False, "extra": None},
-        {
-            "stage": "Downloading",
-            "progress": 0.1,
-            "done": False,
-            "extra": {"current": 539462, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 0.6,
-            "done": False,
-            "extra": {"current": 4864838, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 0.9,
-            "done": False,
-            "extra": {"current": 7552896, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 1.2,
-            "done": False,
-            "extra": {"current": 10252544, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 2.9,
-            "done": False,
-            "extra": {"current": 25369792, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 11.9,
-            "done": False,
-            "extra": {"current": 103619904, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 26.1,
-            "done": False,
-            "extra": {"current": 227726144, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 49.6,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
-        },
-        {
-            "stage": "Verifying Checksum",
-            "progress": 50,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
-        },
-        {
-            "stage": "Download complete",
-            "progress": 50,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 50.1,
-            "done": False,
-            "extra": {"current": 557056, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 60.3,
-            "done": False,
-            "extra": {"current": 89686016, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 70.0,
-            "done": False,
-            "extra": {"current": 174358528, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 80.0,
-            "done": False,
-            "extra": {"current": 261816320, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 88.4,
-            "done": False,
-            "extra": {"current": 334790656, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 94.0,
-            "done": False,
-            "extra": {"current": 383811584, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 99.9,
-            "done": False,
-            "extra": {"current": 435617792, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 100.0,
-            "done": False,
-            "extra": {"current": 436480882, "total": 436480882},
-        },
-        {
-            "stage": "Pull complete",
-            "progress": 100.0,
-            "done": True,
-            "extra": {"current": 436480882, "total": 436480882},
-        },
-    ]
-
-
 async def test_install_progress_rounding_does_not_cause_misses(
-    coresys: CoreSys, test_docker_interface: DockerInterface, ha_ws_client: AsyncMock
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    ha_ws_client: AsyncMock,
+    capture_exception: Mock,
 ):
     """Test extremely close progress events do not create rounding issues."""
     coresys.core.set_state(CoreState.RUNNING)
-    coresys.docker.docker.api.pull.return_value = [
+
+    # Current numbers chosen to create a rounding issue with original code
+    # Where a progress update came in with a value between the actual previous
+    # value and what it was rounded to. It should not raise an out of order exception
+    logs = [
         {
             "status": "Pulling from home-assistant/odroid-n2-homeassistant",
             "id": "2025.7.1",
@@ -647,89 +443,27 @@ async def test_install_progress_rounding_does_not_cause_misses(
             "status": "Status: Downloaded newer image for ghcr.io/home-assistant/odroid-n2-homeassistant:2025.7.1"
         },
     ]
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
 
-    with (
-        patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
-        ),
-    ):
-        # Schedule job so we can listen for the end. Then we can assert against the WS mock
-        event = asyncio.Event()
-        job, install_task = coresys.jobs.schedule_job(
-            test_docker_interface.install,
-            JobSchedulerOptions(),
-            AwesomeVersion("1.2.3"),
-            "test",
-        )
+    # Schedule job so we can listen for the end. Then we can assert against the WS mock
+    event = asyncio.Event()
+    job, install_task = coresys.jobs.schedule_job(
+        test_docker_interface.install,
+        JobSchedulerOptions(),
+        AwesomeVersion("1.2.3"),
+        "test",
+    )
 
-        async def listen_for_job_end(reference: SupervisorJob):
-            if reference.uuid != job.uuid:
-                return
-            event.set()
+    async def listen_for_job_end(reference: SupervisorJob):
+        if reference.uuid != job.uuid:
+            return
+        event.set()
 
-        coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_END, listen_for_job_end)
-        await install_task
-        await event.wait()
+    coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_END, listen_for_job_end)
+    await install_task
+    await event.wait()
 
-    events = [
-        evt.args[0]["data"]["data"]
-        for evt in ha_ws_client.async_send_command.call_args_list
-        if "data" in evt.args[0]
-        and evt.args[0]["data"]["event"] == WSEvent.JOB
-        and evt.args[0]["data"]["data"]["reference"] == "1e214cd6d7d0"
-        and evt.args[0]["data"]["data"]["stage"] in {"Downloading", "Extracting"}
-    ]
-
-    assert events == [
-        {
-            "name": "Pulling container image layer",
-            "stage": "Downloading",
-            "progress": 49.6,
-            "done": False,
-            "extra": {"current": 432700000, "total": 436480882},
-            "reference": "1e214cd6d7d0",
-            "parent_id": job.uuid,
-            "errors": [],
-            "uuid": ANY,
-            "created": ANY,
-        },
-        {
-            "name": "Pulling container image layer",
-            "stage": "Downloading",
-            "progress": 49.6,
-            "done": False,
-            "extra": {"current": 432800000, "total": 436480882},
-            "reference": "1e214cd6d7d0",
-            "parent_id": job.uuid,
-            "errors": [],
-            "uuid": ANY,
-            "created": ANY,
-        },
-        {
-            "name": "Pulling container image layer",
-            "stage": "Extracting",
-            "progress": 99.6,
-            "done": False,
-            "extra": {"current": 432700000, "total": 436480882},
-            "reference": "1e214cd6d7d0",
-            "parent_id": job.uuid,
-            "errors": [],
-            "uuid": ANY,
-            "created": ANY,
-        },
-        {
-            "name": "Pulling container image layer",
-            "stage": "Extracting",
-            "progress": 99.6,
-            "done": False,
-            "extra": {"current": 432800000, "total": 436480882},
-            "reference": "1e214cd6d7d0",
-            "parent_id": job.uuid,
-            "errors": [],
-            "uuid": ANY,
-            "created": ANY,
-        },
-    ]
+    capture_exception.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -760,7 +494,8 @@ async def test_install_raises_on_pull_error(
     exc_msg: str,
 ):
     """Test exceptions raised from errors in pull log."""
-    coresys.docker.docker.api.pull.return_value = [
+
+    logs = [
         {
             "status": "Pulling from home-assistant/odroid-n2-homeassistant",
             "id": "2025.7.2",
@@ -773,19 +508,25 @@ async def test_install_raises_on_pull_error(
         },
         error_log,
     ]
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
 
     with pytest.raises(exc_type, match=exc_msg):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
 
 
 async def test_install_progress_handles_download_restart(
-    coresys: CoreSys, test_docker_interface: DockerInterface, ha_ws_client: AsyncMock
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    ha_ws_client: AsyncMock,
+    capture_exception: Mock,
 ):
     """Test install handles docker progress events that include a download restart."""
     coresys.core.set_state(CoreState.RUNNING)
-    coresys.docker.docker.api.pull.return_value = load_json_fixture(
-        "docker_pull_image_log_restart.json"
-    )
+
+    # Fixture emulates a download restart as it docker logs it
+    # A log out of order exception should not be raised
+    logs = load_json_fixture("docker_pull_image_log_restart.json")
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
 
     with (
         patch.object(
@@ -810,106 +551,172 @@ async def test_install_progress_handles_download_restart(
         await install_task
         await event.wait()
 
-    events = [
-        evt.args[0]["data"]["data"]
-        for evt in ha_ws_client.async_send_command.call_args_list
-        if "data" in evt.args[0] and evt.args[0]["data"]["event"] == WSEvent.JOB
-    ]
+    capture_exception.assert_not_called()
 
-    def make_sub_log(layer_id: str):
-        return [
-            {
-                "stage": evt["stage"],
-                "progress": evt["progress"],
-                "done": evt["done"],
-                "extra": evt["extra"],
-            }
-            for evt in events
-            if evt["name"] == "Pulling container image layer"
-            and evt["reference"] == layer_id
-            and evt["parent_id"] == job.uuid
-        ]
 
-    layer_1_log = make_sub_log("1e214cd6d7d0")
-    assert len(layer_1_log) == 14
-    assert layer_1_log == [
-        {"stage": "Pulling fs layer", "progress": 0, "done": False, "extra": None},
+async def test_install_progress_handles_layers_skipping_download(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    capture_exception: Mock,
+):
+    """Test install handles small layers that skip downloading phase and go directly to download complete.
+
+    Reproduces the real-world scenario from Supervisor issue #6286:
+    - Small layer (02a6e69d8d00) completes Download complete at 10:14:08 without ever Downloading
+    - Normal layer (3f4a84073184) starts Downloading at 10:14:09 with progress updates
+    """
+    coresys.core.set_state(CoreState.RUNNING)
+
+    # Reproduce EXACT sequence from SupervisorNoUpdateProgressLogs.txt:
+    # Small layer (02a6e69d8d00) completes BEFORE normal layer (3f4a84073184) starts downloading
+    logs = [
+        {"status": "Pulling from test/image", "id": "latest"},
+        # Small layer that skips downloading (02a6e69d8d00 in logs, 96 bytes)
+        {"status": "Pulling fs layer", "progressDetail": {}, "id": "02a6e69d8d00"},
+        {"status": "Pulling fs layer", "progressDetail": {}, "id": "3f4a84073184"},
+        {"status": "Waiting", "progressDetail": {}, "id": "02a6e69d8d00"},
+        {"status": "Waiting", "progressDetail": {}, "id": "3f4a84073184"},
+        # Goes straight to Download complete (10:14:08 in logs) - THIS IS THE KEY MOMENT
+        {"status": "Download complete", "progressDetail": {}, "id": "02a6e69d8d00"},
+        # Normal layer that downloads (3f4a84073184 in logs, 25MB)
+        # Downloading starts (10:14:09 in logs) - progress updates should happen NOW!
         {
-            "stage": "Downloading",
-            "progress": 11.9,
-            "done": False,
-            "extra": {"current": 103619904, "total": 436480882},
+            "status": "Downloading",
+            "progressDetail": {"current": 260937, "total": 25371463},
+            "progress": "[>                                                  ]  260.9kB/25.37MB",
+            "id": "3f4a84073184",
         },
         {
-            "stage": "Downloading",
-            "progress": 26.1,
-            "done": False,
-            "extra": {"current": 227726144, "total": 436480882},
+            "status": "Downloading",
+            "progressDetail": {"current": 5505024, "total": 25371463},
+            "progress": "[==========>                                        ]  5.505MB/25.37MB",
+            "id": "3f4a84073184",
         },
         {
-            "stage": "Downloading",
-            "progress": 49.6,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
+            "status": "Downloading",
+            "progressDetail": {"current": 11272192, "total": 25371463},
+            "progress": "[======================>                            ]  11.27MB/25.37MB",
+            "id": "3f4a84073184",
+        },
+        {"status": "Download complete", "progressDetail": {}, "id": "3f4a84073184"},
+        {
+            "status": "Extracting",
+            "progressDetail": {"current": 25371463, "total": 25371463},
+            "progress": "[==================================================>]  25.37MB/25.37MB",
+            "id": "3f4a84073184",
+        },
+        {"status": "Pull complete", "progressDetail": {}, "id": "3f4a84073184"},
+        # Small layer finally extracts (10:14:58 in logs)
+        {
+            "status": "Extracting",
+            "progressDetail": {"current": 96, "total": 96},
+            "progress": "[==================================================>]      96B/96B",
+            "id": "02a6e69d8d00",
+        },
+        {"status": "Pull complete", "progressDetail": {}, "id": "02a6e69d8d00"},
+        {"status": "Digest: sha256:test"},
+        {"status": "Status: Downloaded newer image for test/image:latest"},
+    ]
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
+
+    # Capture immutable snapshots of install job progress using job.as_dict()
+    # This solves the mutable object problem - we snapshot state at call time
+    install_job_snapshots = []
+    original_on_job_change = coresys.jobs._on_job_change  # pylint: disable=W0212
+
+    def capture_and_forward(job_obj, attribute, value):
+        # Capture immutable snapshot if this is the install job with progress
+        if job_obj.name == "docker_interface_install" and job_obj.progress > 0:
+            install_job_snapshots.append(job_obj.as_dict())
+        # Forward to original to maintain functionality
+        return original_on_job_change(job_obj, attribute, value)
+
+    with patch.object(coresys.jobs, "_on_job_change", side_effect=capture_and_forward):
+        event = asyncio.Event()
+        job, install_task = coresys.jobs.schedule_job(
+            test_docker_interface.install,
+            JobSchedulerOptions(),
+            AwesomeVersion("1.2.3"),
+            "test",
+        )
+
+        async def listen_for_job_end(reference: SupervisorJob):
+            if reference.uuid != job.uuid:
+                return
+            event.set()
+
+        coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_END, listen_for_job_end)
+        await install_task
+        await event.wait()
+
+        # First update from layer download should have rather low progress ((260937/25445459) / 2 ~ 0.5%)
+        assert install_job_snapshots[0]["progress"] < 1
+
+        # Total 8 events should lead to a progress update on the install job
+        assert len(install_job_snapshots) == 8
+
+        # Job should complete successfully
+        assert job.done is True
+        assert job.progress == 100
+        capture_exception.assert_not_called()
+
+
+async def test_missing_total_handled_gracefully(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+    ha_ws_client: AsyncMock,
+    capture_exception: Mock,
+):
+    """Test missing 'total' fields in progress details handled gracefully."""
+    coresys.core.set_state(CoreState.RUNNING)
+
+    # Progress details with missing 'total' fields observed in real-world pulls
+    logs = [
+        {
+            "status": "Pulling from home-assistant/odroid-n2-homeassistant",
+            "id": "2025.7.1",
+        },
+        {"status": "Pulling fs layer", "progressDetail": {}, "id": "1e214cd6d7d0"},
+        {
+            "status": "Downloading",
+            "progressDetail": {"current": 436480882},
+            "progress": "[===================================================]  436.5MB/436.5MB",
+            "id": "1e214cd6d7d0",
+        },
+        {"status": "Verifying Checksum", "progressDetail": {}, "id": "1e214cd6d7d0"},
+        {"status": "Download complete", "progressDetail": {}, "id": "1e214cd6d7d0"},
+        {
+            "status": "Extracting",
+            "progressDetail": {"current": 436480882},
+            "progress": "[===================================================]  436.5MB/436.5MB",
+            "id": "1e214cd6d7d0",
+        },
+        {"status": "Pull complete", "progressDetail": {}, "id": "1e214cd6d7d0"},
+        {
+            "status": "Digest: sha256:7d97da645f232f82a768d0a537e452536719d56d484d419836e53dbe3e4ec736"
         },
         {
-            "stage": "Retrying download",
-            "progress": 0,
-            "done": False,
-            "extra": None,
-        },
-        {
-            "stage": "Retrying download",
-            "progress": 0,
-            "done": False,
-            "extra": None,
-        },
-        {
-            "stage": "Downloading",
-            "progress": 11.9,
-            "done": False,
-            "extra": {"current": 103619904, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 26.1,
-            "done": False,
-            "extra": {"current": 227726144, "total": 436480882},
-        },
-        {
-            "stage": "Downloading",
-            "progress": 49.6,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
-        },
-        {
-            "stage": "Verifying Checksum",
-            "progress": 50,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
-        },
-        {
-            "stage": "Download complete",
-            "progress": 50,
-            "done": False,
-            "extra": {"current": 433170048, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 80.0,
-            "done": False,
-            "extra": {"current": 261816320, "total": 436480882},
-        },
-        {
-            "stage": "Extracting",
-            "progress": 100.0,
-            "done": False,
-            "extra": {"current": 436480882, "total": 436480882},
-        },
-        {
-            "stage": "Pull complete",
-            "progress": 100.0,
-            "done": True,
-            "extra": {"current": 436480882, "total": 436480882},
+            "status": "Status: Downloaded newer image for ghcr.io/home-assistant/odroid-n2-homeassistant:2025.7.1"
         },
     ]
+    coresys.docker.images.pull.return_value = AsyncIterator(logs)
+
+    # Schedule job so we can listen for the end. Then we can assert against the WS mock
+    event = asyncio.Event()
+    job, install_task = coresys.jobs.schedule_job(
+        test_docker_interface.install,
+        JobSchedulerOptions(),
+        AwesomeVersion("1.2.3"),
+        "test",
+    )
+
+    async def listen_for_job_end(reference: SupervisorJob):
+        if reference.uuid != job.uuid:
+            return
+        event.set()
+
+    coresys.bus.register_event(BusEvent.SUPERVISOR_JOB_END, listen_for_job_end)
+    await install_task
+    await event.wait()
+
+    capture_exception.assert_not_called()

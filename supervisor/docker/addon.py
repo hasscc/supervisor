@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import aiodocker
 from attr import evolve
 from awesomeversion import AwesomeVersion
 import docker
@@ -318,7 +319,18 @@ class DockerAddon(DockerInterface):
             mem = 128 * 1024 * 1024
             limits.append(docker.types.Ulimit(name="memlock", soft=mem, hard=mem))
 
-        # Return None if no capabilities is present
+        # Add configurable ulimits from add-on config
+        for name, config in self.addon.ulimits.items():
+            if isinstance(config, int):
+                # Simple format: both soft and hard limits are the same
+                limits.append(docker.types.Ulimit(name=name, soft=config, hard=config))
+            elif isinstance(config, dict):
+                # Detailed format: both soft and hard limits are mandatory
+                soft = config["soft"]
+                hard = config["hard"]
+                limits.append(docker.types.Ulimit(name=name, soft=soft, hard=hard))
+
+        # Return None if no ulimits are present
         if limits:
             return limits
         return None
@@ -706,19 +718,21 @@ class DockerAddon(DockerInterface):
                 error_message = f"Docker build failed for {addon_image_tag} (exit code {result.exit_code}). Build output:\n{logs}"
                 raise docker.errors.DockerException(error_message)
 
-            addon_image = self.sys_docker.images.get(addon_image_tag)
-
-            return addon_image, logs
+            return addon_image_tag, logs
 
         try:
-            docker_image, log = await self.sys_run_in_executor(build_image)
+            addon_image_tag, log = await self.sys_run_in_executor(build_image)
 
             _LOGGER.debug("Build %s:%s done: %s", self.image, version, log)
 
             # Update meta data
-            self._meta = docker_image.attrs
+            self._meta = await self.sys_docker.images.inspect(addon_image_tag)
 
-        except (docker.errors.DockerException, requests.RequestException) as err:
+        except (
+            docker.errors.DockerException,
+            requests.RequestException,
+            aiodocker.DockerError,
+        ) as err:
             _LOGGER.error("Can't build %s:%s: %s", self.image, version, err)
             raise DockerError() from err
 
@@ -740,11 +754,8 @@ class DockerAddon(DockerInterface):
     )
     async def import_image(self, tar_file: Path) -> None:
         """Import a tar file as image."""
-        docker_image = await self.sys_run_in_executor(
-            self.sys_docker.import_image, tar_file
-        )
-        if docker_image:
-            self._meta = docker_image.attrs
+        if docker_image := await self.sys_docker.import_image(tar_file):
+            self._meta = docker_image
             _LOGGER.info("Importing image %s and version %s", tar_file, self.version)
 
             with suppress(DockerError):
@@ -758,17 +769,21 @@ class DockerAddon(DockerInterface):
         version: AwesomeVersion | None = None,
     ) -> None:
         """Check if old version exists and cleanup other versions of image not in use."""
-        await self.sys_run_in_executor(
-            self.sys_docker.cleanup_old_images,
-            (image := image or self.image),
-            version or self.version,
+        if not (use_image := image or self.image):
+            raise DockerError("Cannot determine image from metadata!", _LOGGER.error)
+        if not (use_version := version or self.version):
+            raise DockerError("Cannot determine version from metadata!", _LOGGER.error)
+
+        await self.sys_docker.cleanup_old_images(
+            use_image,
+            use_version,
             {old_image} if old_image else None,
             keep_images={
                 f"{addon.image}:{addon.version}"
                 for addon in self.sys_addons.installed
                 if addon.slug != self.addon.slug
                 and addon.image
-                and addon.image in {old_image, image}
+                and addon.image in {old_image, use_image}
             },
         )
 
@@ -834,16 +849,6 @@ class DockerAddon(DockerInterface):
             and self.addon.device_access_missing_issue in self.sys_resolution.issues
         ):
             self.sys_resolution.dismiss_issue(self.addon.device_access_missing_issue)
-
-    async def _validate_trust(self, image_id: str) -> None:
-        """Validate trust of content."""
-        if not self.addon.signed:
-            return
-
-        checksum = image_id.partition(":")[2]
-        return await self.sys_security.verify_content(
-            cast(str, self.addon.codenotary), checksum
-        )
 
     @Job(
         name="docker_addon_hardware_events",

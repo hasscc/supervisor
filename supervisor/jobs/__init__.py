@@ -9,7 +9,7 @@ from contextvars import Context, ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime
 import logging
-from typing import Any, Self
+from typing import Any, Self, cast
 from uuid import uuid4
 
 from attr.validators import gt, lt
@@ -98,7 +98,9 @@ class SupervisorJobError:
     """Representation of an error occurring during a supervisor job."""
 
     type_: type[HassioError] = HassioError
-    message: str = "Unknown error, see supervisor logs"
+    message: str = (
+        "Unknown error, see Supervisor logs (check with 'ha supervisor logs')"
+    )
     stage: str | None = None
 
     def as_dict(self) -> dict[str, str | None]:
@@ -194,7 +196,7 @@ class SupervisorJob:
         self,
         progress: float | None = None,
         stage: str | None = None,
-        extra: dict[str, Any] | None = DEFAULT,  # type: ignore
+        extra: dict[str, Any] | None | type[DEFAULT] = DEFAULT,
         done: bool | None = None,
     ) -> None:
         """Update multiple fields with one on change event."""
@@ -205,8 +207,8 @@ class SupervisorJob:
             self.progress = progress
         if stage is not None:
             self.stage = stage
-        if extra != DEFAULT:
-            self.extra = extra
+        if extra is not DEFAULT:
+            self.extra = cast(dict[str, Any] | None, extra)
 
         # Done has special event. use that to trigger on change if included
         # If not then just use any other field to trigger
@@ -282,8 +284,10 @@ class JobManager(FileConfiguration, CoreSysAttributes):
                 # reporting shouldn't raise and break the active job
                 continue
 
-            progress = sync.starting_progress + (
-                sync.progress_allocation * job_data["progress"]
+            progress = min(
+                100,
+                sync.starting_progress
+                + (sync.progress_allocation * job_data["progress"]),
             )
             # Using max would always trigger on change even if progress was unchanged
             # pylint: disable-next=R1731
@@ -302,19 +306,21 @@ class JobManager(FileConfiguration, CoreSysAttributes):
         reference: str | None = None,
         initial_stage: str | None = None,
         internal: bool = False,
-        parent_id: str | None = DEFAULT,  # type: ignore
+        parent_id: str | None | type[DEFAULT] = DEFAULT,
         child_job_syncs: list[ChildJobSyncFilter] | None = None,
     ) -> SupervisorJob:
         """Create a new job."""
-        job = SupervisorJob(
-            name,
-            reference=reference,
-            stage=initial_stage,
-            on_change=self._on_job_change,
-            internal=internal,
-            child_job_syncs=child_job_syncs,
-            **({} if parent_id == DEFAULT else {"parent_id": parent_id}),  # type: ignore
-        )
+        kwargs: dict[str, Any] = {
+            "reference": reference,
+            "stage": initial_stage,
+            "on_change": self._on_job_change,
+            "internal": internal,
+            "child_job_syncs": child_job_syncs,
+        }
+        if parent_id is not DEFAULT:
+            kwargs["parent_id"] = parent_id
+
+        job = SupervisorJob(name, **kwargs)
 
         # Shouldn't happen but inability to find a parent for progress reporting
         # shouldn't raise and break the active job
@@ -323,6 +329,17 @@ class JobManager(FileConfiguration, CoreSysAttributes):
             while curr_parent.parent_id:
                 curr_parent = self.get_job(curr_parent.parent_id)
                 if not curr_parent.child_job_syncs:
+                    continue
+
+                # HACK: If parent trigger the same child job, we just skip this second
+                # sync. Maybe it would be better to have this reflected in the job stage
+                # and reset progress to 0 instead? There is no support for such stage
+                # information on Core update entities today though.
+                if curr_parent.done is True or curr_parent.progress >= 100:
+                    _LOGGER.debug(
+                        "Skipping parent job sync for done parent job %s",
+                        curr_parent.name,
+                    )
                     continue
 
                 # Break after first match at each parent as it doesn't make sense

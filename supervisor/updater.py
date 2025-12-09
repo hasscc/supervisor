@@ -31,14 +31,8 @@ from .const import (
     UpdateChannel,
 )
 from .coresys import CoreSys, CoreSysAttributes
-from .exceptions import (
-    CodeNotaryError,
-    CodeNotaryUntrusted,
-    UpdaterError,
-    UpdaterJobError,
-)
+from .exceptions import UpdaterError, UpdaterJobError
 from .jobs.decorator import Job, JobCondition
-from .utils.codenotary import calc_checksum
 from .utils.common import FileConfiguration
 from .validate import SCHEMA_UPDATER_CONFIG
 
@@ -248,9 +242,10 @@ class Updater(FileConfiguration, CoreSysAttributes):
     @Job(
         name="updater_fetch_data",
         conditions=[
+            JobCondition.ARCHITECTURE_SUPPORTED,
             JobCondition.INTERNET_SYSTEM,
-            JobCondition.OS_SUPPORTED,
             JobCondition.HOME_ASSISTANT_CORE_SUPPORTED,
+            JobCondition.OS_SUPPORTED,
         ],
         on_condition=UpdaterJobError,
         throttle_period=timedelta(seconds=30),
@@ -288,19 +283,6 @@ class Updater(FileConfiguration, CoreSysAttributes):
         if self._connectivity_listener:
             self.sys_bus.remove_listener(self._connectivity_listener)
             self._connectivity_listener = None
-
-        # Validate
-        try:
-            await self.sys_security.verify_own_content(calc_checksum(data))
-        except CodeNotaryUntrusted as err:
-            raise UpdaterError(
-                "Content-Trust is broken for the version file fetch!", _LOGGER.critical
-            ) from err
-        except CodeNotaryError as err:
-            raise UpdaterError(
-                f"CodeNotary error while processing version fetch: {err!s}",
-                _LOGGER.error,
-            ) from err
 
         # Parse data
         try:

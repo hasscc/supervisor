@@ -6,17 +6,18 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Awaitable
 from contextlib import suppress
+from http import HTTPStatus
 import logging
 import re
 from time import time
 from typing import Any, cast
 from uuid import uuid4
 
+import aiodocker
 from awesomeversion import AwesomeVersion
 from awesomeversion.strategy import AwesomeVersionStrategy
 import docker
 from docker.models.containers import Container
-from docker.models.images import Image
 import requests
 
 from ..bus import EventListener
@@ -31,15 +32,13 @@ from ..const import (
 )
 from ..coresys import CoreSys
 from ..exceptions import (
-    CodeNotaryError,
-    CodeNotaryUntrusted,
     DockerAPIError,
     DockerError,
+    DockerHubRateLimitExceeded,
     DockerJobError,
     DockerLogOutOfOrder,
     DockerNotFound,
     DockerRequestError,
-    DockerTrustError,
 )
 from ..jobs import SupervisorJob
 from ..jobs.const import JOB_GROUP_DOCKER_INTERFACE, JobConcurrency
@@ -218,12 +217,14 @@ class DockerInterface(JobGroup, ABC):
         if not credentials:
             return
 
-        await self.sys_run_in_executor(self.sys_docker.docker.login, **credentials)
+        await self.sys_run_in_executor(self.sys_docker.dockerpy.login, **credentials)
 
-    def _process_pull_image_log(self, job_id: str, reference: PullLogEntry) -> None:
+    def _process_pull_image_log(  # noqa: C901
+        self, install_job_id: str, reference: PullLogEntry
+    ) -> None:
         """Process events fired from a docker while pulling an image, filtered to a given job id."""
         if (
-            reference.job_id != job_id
+            reference.job_id != install_job_id
             or not reference.id
             or not reference.status
             or not (stage := PullImageLayerStage.from_status(reference.status))
@@ -237,21 +238,22 @@ class DockerInterface(JobGroup, ABC):
                 name="Pulling container image layer",
                 initial_stage=stage.status,
                 reference=reference.id,
-                parent_id=job_id,
+                parent_id=install_job_id,
+                internal=True,
             )
             job.done = False
             return
 
         # Find our sub job to update details of
         for j in self.sys_jobs.jobs:
-            if j.parent_id == job_id and j.reference == reference.id:
+            if j.parent_id == install_job_id and j.reference == reference.id:
                 job = j
                 break
 
         # This likely only occurs if the logs came in out of sync and we got progress before the Pulling FS Layer one
         if not job:
             raise DockerLogOutOfOrder(
-                f"Received pull image log with status {reference.status} for image id {reference.id} and parent job {job_id} but could not find a matching job, skipping",
+                f"Received pull image log with status {reference.status} for image id {reference.id} and parent job {install_job_id} but could not find a matching job, skipping",
                 _LOGGER.debug,
             )
 
@@ -303,9 +305,13 @@ class DockerInterface(JobGroup, ABC):
         # Our filters have all passed. Time to update the job
         # Only downloading and extracting have progress details. Use that to set extra
         # We'll leave it around on later stages as the total bytes may be useful after that stage
+        # Enforce range to prevent float drift error
+        progress = max(0, min(progress, 100))
         if (
             stage in {PullImageLayerStage.DOWNLOADING, PullImageLayerStage.EXTRACTING}
             and reference.progress_detail
+            and reference.progress_detail.current is not None
+            and reference.progress_detail.total is not None
         ):
             job.update(
                 progress=progress,
@@ -316,19 +322,69 @@ class DockerInterface(JobGroup, ABC):
                 },
             )
         else:
+            # If we reach DOWNLOAD_COMPLETE without ever having set extra (small layers that skip
+            # the downloading phase), set a minimal extra so aggregate progress calculation can proceed
+            extra = job.extra
+            if stage == PullImageLayerStage.DOWNLOAD_COMPLETE and not job.extra:
+                extra = {"current": 1, "total": 1}
+
             job.update(
                 progress=progress,
                 stage=stage.status,
                 done=stage == PullImageLayerStage.PULL_COMPLETE,
-                extra=None
-                if stage == PullImageLayerStage.RETRYING_DOWNLOAD
-                else job.extra,
+                extra=None if stage == PullImageLayerStage.RETRYING_DOWNLOAD else extra,
             )
+
+        # Once we have received a progress update for every child job, start to set status of the main one
+        install_job = self.sys_jobs.get_job(install_job_id)
+        layer_jobs = [
+            job
+            for job in self.sys_jobs.jobs
+            if job.parent_id == install_job.uuid
+            and job.name == "Pulling container image layer"
+        ]
+
+        # First set the total bytes to be downloaded/extracted on the main job
+        if not install_job.extra:
+            total = 0
+            for job in layer_jobs:
+                if not job.extra:
+                    return
+                total += job.extra["total"]
+            install_job.extra = {"total": total}
+        else:
+            total = install_job.extra["total"]
+
+        # Then determine total progress based on progress of each sub-job, factoring in size of each compared to total
+        progress = 0.0
+        stage = PullImageLayerStage.PULL_COMPLETE
+        for job in layer_jobs:
+            if not job.extra:
+                return
+            progress += job.progress * (job.extra["total"] / total)
+            job_stage = PullImageLayerStage.from_status(cast(str, job.stage))
+
+            if job_stage < PullImageLayerStage.EXTRACTING:
+                stage = PullImageLayerStage.DOWNLOADING
+            elif (
+                stage == PullImageLayerStage.PULL_COMPLETE
+                and job_stage < PullImageLayerStage.PULL_COMPLETE
+            ):
+                stage = PullImageLayerStage.EXTRACTING
+
+        # Ensure progress is 100 at this point to prevent float drift
+        if stage == PullImageLayerStage.PULL_COMPLETE:
+            progress = 100
+
+        # To reduce noise, limit updates to when result has changed by an entire percent or when stage changed
+        if stage != install_job.stage or progress >= install_job.progress + 1:
+            install_job.update(stage=stage.status, progress=max(0, min(progress, 100)))
 
     @Job(
         name="docker_interface_install",
         on_condition=DockerJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
+        internal=True,
     )
     async def install(
         self,
@@ -351,11 +407,11 @@ class DockerInterface(JobGroup, ABC):
                 # Try login if we have defined credentials
                 await self._docker_login(image)
 
-            job_id = self.sys_jobs.current.uuid
+            curr_job_id = self.sys_jobs.current.uuid
 
             async def process_pull_image_log(reference: PullLogEntry) -> None:
                 try:
-                    self._process_pull_image_log(job_id, reference)
+                    self._process_pull_image_log(curr_job_id, reference)
                 except DockerLogOutOfOrder as err:
                     # Send all these to sentry. Missing a few progress updates
                     # shouldn't matter to users but matters to us
@@ -366,73 +422,63 @@ class DockerInterface(JobGroup, ABC):
             )
 
             # Pull new image
-            docker_image = await self.sys_run_in_executor(
-                self.sys_docker.pull_image,
+            docker_image = await self.sys_docker.pull_image(
                 self.sys_jobs.current.uuid,
                 image,
                 str(version),
                 platform=MAP_ARCH[image_arch],
             )
 
-            # Validate content
-            try:
-                await self._validate_trust(cast(str, docker_image.id))
-            except CodeNotaryError:
-                with suppress(docker.errors.DockerException):
-                    await self.sys_run_in_executor(
-                        self.sys_docker.images.remove,
-                        image=f"{image}:{version!s}",
-                        force=True,
-                    )
-                raise
-
             # Tag latest
             if latest:
                 _LOGGER.info(
                     "Tagging image %s with version %s as latest", image, version
                 )
-                await self.sys_run_in_executor(docker_image.tag, image, tag="latest")
+                await self.sys_docker.images.tag(
+                    docker_image["Id"], image, tag="latest"
+                )
         except docker.errors.APIError as err:
-            if err.status_code == 429:
+            if err.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                 self.sys_resolution.create_issue(
                     IssueType.DOCKER_RATELIMIT,
                     ContextType.SYSTEM,
                     suggestions=[SuggestionType.REGISTRY_LOGIN],
                 )
-                _LOGGER.info(
-                    "Your IP address has made too many requests to Docker Hub which activated a rate limit. "
-                    "For more details see https://www.home-assistant.io/more-info/dockerhub-rate-limit"
-                )
+                raise DockerHubRateLimitExceeded(_LOGGER.error) from err
+            await async_capture_exception(err)
             raise DockerError(
                 f"Can't install {image}:{version!s}: {err}", _LOGGER.error
             ) from err
-        except (docker.errors.DockerException, requests.RequestException) as err:
+        except aiodocker.DockerError as err:
+            if err.status == HTTPStatus.TOO_MANY_REQUESTS:
+                self.sys_resolution.create_issue(
+                    IssueType.DOCKER_RATELIMIT,
+                    ContextType.SYSTEM,
+                    suggestions=[SuggestionType.REGISTRY_LOGIN],
+                )
+                raise DockerHubRateLimitExceeded(_LOGGER.error) from err
+            await async_capture_exception(err)
+            raise DockerError(
+                f"Can't install {image}:{version!s}: {err}", _LOGGER.error
+            ) from err
+        except (
+            docker.errors.DockerException,
+            requests.RequestException,
+        ) as err:
             await async_capture_exception(err)
             raise DockerError(
                 f"Unknown error with {image}:{version!s} -> {err!s}", _LOGGER.error
-            ) from err
-        except CodeNotaryUntrusted as err:
-            raise DockerTrustError(
-                f"Pulled image {image}:{version!s} failed on content-trust verification!",
-                _LOGGER.critical,
-            ) from err
-        except CodeNotaryError as err:
-            raise DockerTrustError(
-                f"Error happened on Content-Trust check for {image}:{version!s}: {err!s}",
-                _LOGGER.error,
             ) from err
         finally:
             if listener:
                 self.sys_bus.remove_listener(listener)
 
-        self._meta = docker_image.attrs
+        self._meta = docker_image
 
     async def exists(self) -> bool:
         """Return True if Docker image exists in local repository."""
-        with suppress(docker.errors.DockerException, requests.RequestException):
-            await self.sys_run_in_executor(
-                self.sys_docker.images.get, f"{self.image}:{self.version!s}"
-            )
+        with suppress(aiodocker.DockerError, requests.RequestException):
+            await self.sys_docker.images.inspect(f"{self.image}:{self.version!s}")
             return True
         return False
 
@@ -491,11 +537,11 @@ class DockerInterface(JobGroup, ABC):
                     ),
                 )
 
-        with suppress(docker.errors.DockerException, requests.RequestException):
+        with suppress(aiodocker.DockerError, requests.RequestException):
             if not self._meta and self.image:
-                self._meta = self.sys_docker.images.get(
+                self._meta = await self.sys_docker.images.inspect(
                     f"{self.image}:{version!s}"
-                ).attrs
+                )
 
         # Successful?
         if not self._meta:
@@ -563,14 +609,17 @@ class DockerInterface(JobGroup, ABC):
     )
     async def remove(self, *, remove_image: bool = True) -> None:
         """Remove Docker images."""
+        if not self.image or not self.version:
+            raise DockerError(
+                "Cannot determine image and/or version from metadata!", _LOGGER.error
+            )
+
         # Cleanup container
         with suppress(DockerError):
             await self.stop()
 
         if remove_image:
-            await self.sys_run_in_executor(
-                self.sys_docker.remove_image, self.image, self.version
-            )
+            await self.sys_docker.remove_image(self.image, self.version)
 
         self._meta = None
 
@@ -592,18 +641,16 @@ class DockerInterface(JobGroup, ABC):
         image_name = f"{expected_image}:{version!s}"
         if self.image == expected_image:
             try:
-                image: Image = await self.sys_run_in_executor(
-                    self.sys_docker.images.get, image_name
-                )
-            except (docker.errors.DockerException, requests.RequestException) as err:
+                image = await self.sys_docker.images.inspect(image_name)
+            except (aiodocker.DockerError, requests.RequestException) as err:
                 raise DockerError(
                     f"Could not get {image_name} for check due to: {err!s}",
                     _LOGGER.error,
                 ) from err
 
-            image_arch = f"{image.attrs['Os']}/{image.attrs['Architecture']}"
-            if "Variant" in image.attrs:
-                image_arch = f"{image_arch}/{image.attrs['Variant']}"
+            image_arch = f"{image['Os']}/{image['Architecture']}"
+            if "Variant" in image:
+                image_arch = f"{image_arch}/{image['Variant']}"
 
             # If we have an image and its the right arch, all set
             # It seems that newer Docker version return a variant for arm64 images.
@@ -629,7 +676,10 @@ class DockerInterface(JobGroup, ABC):
         concurrency=JobConcurrency.GROUP_REJECT,
     )
     async def update(
-        self, version: AwesomeVersion, image: str | None = None, latest: bool = False
+        self,
+        version: AwesomeVersion,
+        image: str | None = None,
+        latest: bool = False,
     ) -> None:
         """Update a Docker image."""
         image = image or self.image
@@ -662,11 +712,13 @@ class DockerInterface(JobGroup, ABC):
         version: AwesomeVersion | None = None,
     ) -> None:
         """Check if old version exists and cleanup."""
-        await self.sys_run_in_executor(
-            self.sys_docker.cleanup_old_images,
-            image or self.image,
-            version or self.version,
-            {old_image} if old_image else None,
+        if not (use_image := image or self.image):
+            raise DockerError("Cannot determine image from metadata!", _LOGGER.error)
+        if not (use_version := version or self.version):
+            raise DockerError("Cannot determine version from metadata!", _LOGGER.error)
+
+        await self.sys_docker.cleanup_old_images(
+            use_image, use_version, {old_image} if old_image else None
         )
 
     @Job(
@@ -718,10 +770,10 @@ class DockerInterface(JobGroup, ABC):
         """Return latest version of local image."""
         available_version: list[AwesomeVersion] = []
         try:
-            for image in await self.sys_run_in_executor(
-                self.sys_docker.images.list, self.image
+            for image in await self.sys_docker.images.list(
+                filters=f'{{"reference": ["{self.image}"]}}'
             ):
-                for tag in image.tags:
+                for tag in image["RepoTags"]:
                     version = AwesomeVersion(tag.partition(":")[2])
                     if version.strategy == AwesomeVersionStrategy.UNKNOWN:
                         continue
@@ -730,7 +782,7 @@ class DockerInterface(JobGroup, ABC):
             if not available_version:
                 raise ValueError()
 
-        except (docker.errors.DockerException, ValueError) as err:
+        except (aiodocker.DockerError, ValueError) as err:
             raise DockerNotFound(
                 f"No version found for {self.image}", _LOGGER.info
             ) from err
@@ -755,24 +807,3 @@ class DockerInterface(JobGroup, ABC):
         return self.sys_run_in_executor(
             self.sys_docker.container_run_inside, self.name, command
         )
-
-    async def _validate_trust(self, image_id: str) -> None:
-        """Validate trust of content."""
-        checksum = image_id.partition(":")[2]
-        return await self.sys_security.verify_own_content(checksum)
-
-    @Job(
-        name="docker_interface_check_trust",
-        on_condition=DockerJobError,
-        concurrency=JobConcurrency.GROUP_REJECT,
-    )
-    async def check_trust(self) -> None:
-        """Check trust of exists Docker image."""
-        try:
-            image = await self.sys_run_in_executor(
-                self.sys_docker.images.get, f"{self.image}:{self.version!s}"
-            )
-        except (docker.errors.DockerException, requests.RequestException):
-            return
-
-        await self._validate_trust(cast(str, image.id))
