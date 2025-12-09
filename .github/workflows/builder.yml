@@ -53,7 +53,7 @@ jobs:
       requirements: ${{ steps.requirements.outputs.changed }}
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
           fetch-depth: 0
 
@@ -92,7 +92,7 @@ jobs:
         arch: ${{ fromJson(needs.init.outputs.architectures) }}
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
           fetch-depth: 0
 
@@ -107,7 +107,7 @@ jobs:
       # home-assistant/wheels doesn't support sha pinning
       - name: Build wheels
         if: needs.init.outputs.requirements == 'true'
-        uses: home-assistant/wheels@2025.09.1
+        uses: home-assistant/wheels@2025.10.0
         with:
           abi: cp313
           tag: musllinux_1_2
@@ -132,7 +132,7 @@ jobs:
 
       - name: Install Cosign
         if: needs.init.outputs.publish == 'true'
-        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3.10.0
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
         with:
           cosign-release: "v2.5.3"
 
@@ -171,8 +171,6 @@ jobs:
             --cosign \
             --docker-hub ghcr.io/${{ github.repository_owner }} \
             --generic ${{ needs.init.outputs.version }}
-        env:
-          CAS_API_KEY: ${{ secrets.CAS_TOKEN }}
 
   version:
     name: Update version
@@ -181,7 +179,7 @@ jobs:
     steps:
       - name: Checkout the repository
         if: needs.init.outputs.publish == 'true'
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
       - name: Initialize git
         if: needs.init.outputs.publish == 'true'
@@ -206,7 +204,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
       # home-assistant/builder doesn't support sha pinning
       - name: Build the Supervisor
@@ -291,33 +289,6 @@ jobs:
           # Make sure its state is started
           test="$(docker exec hassio_cli ha addons info core_ssh --no-progress --raw-json | jq -r '.data.state')"
           if [ "$test" != "started" ]; then
-            exit 1
-          fi
-
-      - name: Check the Supervisor code sign
-        if: needs.init.outputs.publish == 'true'
-        run: |
-          echo "Enable Content-Trust"
-          test=$(docker exec hassio_cli ha security options --content-trust=true --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ]; then
-            exit 1
-          fi
-
-          echo "Run supervisor health check"
-          test=$(docker exec hassio_cli ha resolution healthcheck --no-progress --raw-json | jq -r '.result')
-          if [ "$test" != "ok" ]; then
-            exit 1
-          fi
-
-          echo "Check supervisor unhealthy"
-          test=$(docker exec hassio_cli ha resolution info --no-progress --raw-json | jq -r '.data.unhealthy[]')
-          if [ "$test" != "" ]; then
-            exit 1
-          fi
-
-          echo "Check supervisor supported"
-          test=$(docker exec hassio_cli ha resolution info --no-progress --raw-json | jq -r '.data.unsupported[]')
-          if [[ "$test" =~ source_mods ]]; then
             exit 1
           fi
 

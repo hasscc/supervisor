@@ -206,6 +206,7 @@ class APIHost(CoreSysAttributes):
         identifier: str | None = None,
         follow: bool = False,
         latest: bool = False,
+        no_colors: bool = False,
     ) -> web.StreamResponse:
         """Return systemd-journald logs."""
         log_formatter = LogFormatter.PLAIN
@@ -251,6 +252,9 @@ class APIHost(CoreSysAttributes):
         if "verbose" in request.query or request.headers[ACCEPT] == CONTENT_TYPE_X_LOG:
             log_formatter = LogFormatter.VERBOSE
 
+        if "no_colors" in request.query:
+            no_colors = True
+
         if "lines" in request.query:
             lines = request.query.get("lines", DEFAULT_LINES)
             try:
@@ -280,7 +284,9 @@ class APIHost(CoreSysAttributes):
                 response = web.StreamResponse()
                 response.content_type = CONTENT_TYPE_TEXT
                 headers_returned = False
-                async for cursor, line in journal_logs_reader(resp, log_formatter):
+                async for cursor, line in journal_logs_reader(
+                    resp, log_formatter, no_colors
+                ):
                     try:
                         if not headers_returned:
                             if cursor:
@@ -318,9 +324,12 @@ class APIHost(CoreSysAttributes):
         identifier: str | None = None,
         follow: bool = False,
         latest: bool = False,
+        no_colors: bool = False,
     ) -> web.StreamResponse:
         """Return systemd-journald logs. Wrapped as standard API handler."""
-        return await self.advanced_logs_handler(request, identifier, follow, latest)
+        return await self.advanced_logs_handler(
+            request, identifier, follow, latest, no_colors
+        )
 
     @api_process
     async def disk_usage(self, request: web.Request) -> dict:
@@ -334,7 +343,7 @@ class APIHost(CoreSysAttributes):
 
         disk = self.sys_hardware.disk
 
-        total, used, _ = await self.sys_run_in_executor(
+        total, _, free = await self.sys_run_in_executor(
             disk.disk_usage, self.sys_config.path_supervisor
         )
 
@@ -356,12 +365,13 @@ class APIHost(CoreSysAttributes):
             "id": "root",
             "label": "Root",
             "total_bytes": total,
-            "used_bytes": used,
+            "used_bytes": total - free,
             "children": [
                 {
                     "id": "system",
                     "label": "System",
-                    "used_bytes": used
+                    "used_bytes": total
+                    - free
                     - sum(path["used_bytes"] for path in known_paths),
                 },
                 *known_paths,
