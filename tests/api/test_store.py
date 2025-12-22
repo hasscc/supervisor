@@ -4,13 +4,12 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
-from aiohttp import ClientResponse
 from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
 import pytest
 
 from supervisor.addons.addon import Addon
-from supervisor.arch import CpuArch
+from supervisor.arch import CpuArchManager
 from supervisor.backups.manager import BackupManager
 from supervisor.config import CoreConfig
 from supervisor.const import AddonState, CoreState
@@ -191,7 +190,9 @@ async def test_api_store_update_healthcheck(
         patch.object(DockerAddon, "run", new=container_events_task),
         patch.object(DockerInterface, "install"),
         patch.object(DockerAddon, "is_running", return_value=False),
-        patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])),
+        patch.object(
+            CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+        ),
     ):
         resp = await api_client.post(f"/store/addons/{TEST_ADDON_SLUG}/update")
 
@@ -290,14 +291,6 @@ async def test_api_detached_addon_documentation(
     assert result == "Addon local_ssh does not exist in the store"
 
 
-async def get_message(resp: ClientResponse, json_expected: bool) -> str:
-    """Get message from response based on response type."""
-    if json_expected:
-        body = await resp.json()
-        return body["message"]
-    return await resp.text()
-
-
 @pytest.mark.parametrize(
     ("method", "url", "json_expected"),
     [
@@ -323,7 +316,13 @@ async def test_store_addon_not_found(
     """Test store addon not found error."""
     resp = await api_client.request(method, url)
     assert resp.status == 404
-    assert await get_message(resp, json_expected) == "Addon bad does not exist"
+    if json_expected:
+        body = await resp.json()
+        assert body["message"] == "Addon bad does not exist in the store"
+        assert body["error_key"] == "store_addon_not_found_error"
+        assert body["extra_fields"] == {"addon": "bad"}
+    else:
+        assert await resp.text() == "Addon bad does not exist in the store"
 
 
 @pytest.mark.parametrize(
@@ -548,7 +547,9 @@ async def test_api_store_addons_addon_availability_arch_not_supported(
         coresys.addons.data.user[addon_obj.slug] = {"version": AwesomeVersion("0.0.1")}
 
     # Mock the system architecture to be different
-    with patch.object(CpuArch, "supported", new=PropertyMock(return_value=["amd64"])):
+    with patch.object(
+        CpuArchManager, "supported", new=PropertyMock(return_value=["amd64"])
+    ):
         resp = await api_client.request(
             api_method, f"/store/addons/{addon_obj.slug}/{api_action}"
         )
@@ -773,29 +774,29 @@ async def test_api_progress_updates_addon_install_update(
         },
         {
             "stage": None,
-            "progress": 1.2,
+            "progress": 1.7,
             "done": False,
         },
         {
             "stage": None,
-            "progress": 2.8,
+            "progress": 4.0,
             "done": False,
         },
     ]
     assert events[-5:] == [
         {
             "stage": None,
-            "progress": 97.2,
+            "progress": 98.2,
             "done": False,
         },
         {
             "stage": None,
-            "progress": 98.4,
+            "progress": 98.3,
             "done": False,
         },
         {
             "stage": None,
-            "progress": 99.4,
+            "progress": 99.3,
             "done": False,
         },
         {

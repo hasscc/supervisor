@@ -49,9 +49,10 @@ from ..exceptions import (
 )
 from ..utils.common import FileConfiguration
 from ..validate import SCHEMA_DOCKER_CONFIG
-from .const import LABEL_MANAGED
+from .const import DOCKER_HUB, DOCKER_HUB_LEGACY, LABEL_MANAGED
 from .monitor import DockerMonitor
 from .network import DockerNetwork
+from .utils import get_registry_from_image
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -111,10 +112,15 @@ class PullProgressDetail:
     """Progress detail information for pull.
 
     Documentation lacking but both of these seem to be in bytes when populated.
+
+    Containerd-snapshot update - When leveraging this new feature, this information
+    becomes useless to us while extracting. It simply tells elapsed time using
+    current and units.
     """
 
     current: int | None = None
     total: int | None = None
+    units: str | None = None
 
     @classmethod
     def from_pull_log_dict(cls, value: dict[str, int]) -> PullProgressDetail:
@@ -201,6 +207,33 @@ class DockerConfig(FileConfiguration):
     def registries(self) -> dict[str, Any]:
         """Return credentials for docker registries."""
         return self._data.get(ATTR_REGISTRIES, {})
+
+    def get_registry_for_image(self, image: str) -> str | None:
+        """Return the registry name if credentials are available for the image.
+
+        Matches the image against configured registries and returns the registry
+        name if found, or None if no matching credentials are configured.
+
+        Uses Docker's domain detection logic from:
+        vendor/github.com/distribution/reference/normalize.go
+        """
+        if not self.registries:
+            return None
+
+        # Check if image uses a custom registry (e.g., ghcr.io/org/image)
+        registry = get_registry_from_image(image)
+        if registry:
+            if registry in self.registries:
+                return registry
+        else:
+            # No registry prefix means Docker Hub
+            # Support both docker.io (official) and hub.docker.com (legacy)
+            if DOCKER_HUB in self.registries:
+                return DOCKER_HUB
+            if DOCKER_HUB_LEGACY in self.registries:
+                return DOCKER_HUB_LEGACY
+
+        return None
 
 
 class DockerAPI(CoreSysAttributes):
@@ -432,6 +465,7 @@ class DockerAPI(CoreSysAttributes):
         repository: str,
         tag: str = "latest",
         platform: str | None = None,
+        auth: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Pull the specified image and return it.
 
@@ -440,8 +474,10 @@ class DockerAPI(CoreSysAttributes):
         raises only if the get fails afterwards. Additionally it fires progress reports for the pull
         on the bus so listeners can use that to update status for users.
         """
+        # Use timeout=None to disable timeout for pull operations, matching docker-py behavior.
+        # aiodocker converts None to ClientTimeout(total=None) which disables the timeout.
         async for e in self.images.pull(
-            repository, tag=tag, platform=platform, stream=True
+            repository, tag=tag, platform=platform, auth=auth, stream=True, timeout=None
         ):
             entry = PullLogEntry.from_pull_log_dict(job_id, e)
             if entry.error:
@@ -581,9 +617,15 @@ class DockerAPI(CoreSysAttributes):
         except aiodocker.DockerError as err:
             if err.status == HTTPStatus.NOT_FOUND:
                 return False
-            raise DockerError() from err
+            raise DockerError(
+                f"Could not get container {name} or image {image}:{version} to check state: {err!s}",
+                _LOGGER.error,
+            ) from err
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Could not get container {name} or image {image}:{version} to check state: {err!s}",
+                _LOGGER.error,
+            ) from err
 
         # Check the image is correct and state is good
         return (
@@ -599,9 +641,13 @@ class DockerAPI(CoreSysAttributes):
         try:
             docker_container: Container = self.containers.get(name)
         except docker_errors.NotFound:
+            # Generally suppressed so we don't log this
             raise DockerNotFound() from None
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Could not get container {name} for stopping: {err!s}",
+                _LOGGER.error,
+            ) from err
 
         if docker_container.status == "running":
             _LOGGER.info("Stopping %s application", name)
@@ -641,9 +687,13 @@ class DockerAPI(CoreSysAttributes):
         try:
             container: Container = self.containers.get(name)
         except docker_errors.NotFound:
-            raise DockerNotFound() from None
+            raise DockerNotFound(
+                f"Container {name} not found for restarting", _LOGGER.warning
+            ) from None
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Could not get container {name} for restarting: {err!s}", _LOGGER.error
+            ) from err
 
         _LOGGER.info("Restarting %s", name)
         try:
@@ -656,9 +706,13 @@ class DockerAPI(CoreSysAttributes):
         try:
             docker_container: Container = self.containers.get(name)
         except docker_errors.NotFound:
-            raise DockerNotFound() from None
+            raise DockerNotFound(
+                f"Container {name} not found for logs", _LOGGER.warning
+            ) from None
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Could not get container {name} for logs: {err!s}", _LOGGER.error
+            ) from err
 
         try:
             return docker_container.logs(tail=tail, stdout=True, stderr=True)
@@ -672,16 +726,21 @@ class DockerAPI(CoreSysAttributes):
         try:
             docker_container: Container = self.containers.get(name)
         except docker_errors.NotFound:
-            raise DockerNotFound() from None
+            raise DockerNotFound(
+                f"Container {name} not found for stats", _LOGGER.warning
+            ) from None
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Could not inspect container '{name}': {err!s}", _LOGGER.error
+            ) from err
 
         # container is not running
         if docker_container.status != "running":
             raise DockerError(f"Container {name} is not running", _LOGGER.error)
 
         try:
-            return docker_container.stats(stream=False)
+            # When stream=False, stats() returns dict, not Iterator
+            return cast(dict[str, Any], docker_container.stats(stream=False))
         except (docker_errors.DockerException, requests.RequestException) as err:
             raise DockerError(
                 f"Can't read stats from {name}: {err}", _LOGGER.error
@@ -692,15 +751,21 @@ class DockerAPI(CoreSysAttributes):
         try:
             docker_container: Container = self.containers.get(name)
         except docker_errors.NotFound:
-            raise DockerNotFound() from None
+            raise DockerNotFound(
+                f"Container {name} not found for running command", _LOGGER.warning
+            ) from None
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Can't get container {name} to run command: {err!s}"
+            ) from err
 
         # Execute
         try:
             code, output = docker_container.exec_run(command)
         except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError() from err
+            raise DockerError(
+                f"Can't run command in container {name}: {err!s}"
+            ) from err
 
         return CommandReturn(code, output)
 
@@ -733,7 +798,7 @@ class DockerAPI(CoreSysAttributes):
         """Import a tar file as image."""
         try:
             with tar_file.open("rb") as read_tar:
-                resp: list[dict[str, Any]] = self.images.import_image(read_tar)
+                resp: list[dict[str, Any]] = await self.images.import_image(read_tar)
         except (aiodocker.DockerError, OSError) as err:
             raise DockerError(
                 f"Can't import image from tar: {err}", _LOGGER.error

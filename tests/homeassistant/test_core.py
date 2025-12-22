@@ -387,7 +387,7 @@ async def test_api_check_timeout(
         ):
             await coresys.homeassistant.core.start()
 
-    assert coresys.homeassistant.api.get_api_state.call_count == 3
+    assert coresys.homeassistant.api.get_api_state.call_count == 10
     assert (
         "No Home Assistant Core response, assuming a fatal startup error" in caplog.text
     )
@@ -477,6 +477,7 @@ async def test_core_loads_wrong_image_for_machine(
             "ghcr.io/home-assistant/qemux86-64-homeassistant",
             "2024.4.0",
             platform="linux/amd64",
+            auth=None,
         )
 
     container.remove.assert_called_once_with(force=True, v=True)
@@ -535,6 +536,7 @@ async def test_core_loads_wrong_image_for_architecture(
             "ghcr.io/home-assistant/qemux86-64-homeassistant",
             "2024.4.0",
             platform="linux/amd64",
+            auth=None,
         )
 
     container.remove.assert_called_once_with(force=True, v=True)

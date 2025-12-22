@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from contextlib import suppress
 from ipaddress import IPv4Address
 import logging
 import os
 from pathlib import Path
+from socket import SocketIO
+import tempfile
 from typing import TYPE_CHECKING, cast
 
 import aiodocker
@@ -33,6 +36,7 @@ from ..coresys import CoreSys
 from ..exceptions import (
     CoreDNSError,
     DBusError,
+    DockerBuildError,
     DockerError,
     DockerJobError,
     DockerNotFound,
@@ -680,13 +684,12 @@ class DockerAddon(DockerInterface):
     async def _build(self, version: AwesomeVersion, image: str | None = None) -> None:
         """Build a Docker container."""
         build_env = await AddonBuild(self.coresys, self.addon).load_config()
-        if not await build_env.is_valid():
-            _LOGGER.error("Invalid build environment, can't build this add-on!")
-            raise DockerError()
+        # Check if the build environment is valid, raises if not
+        await build_env.is_valid()
 
         _LOGGER.info("Starting build for %s:%s", self.image, version)
 
-        def build_image():
+        def build_image() -> tuple[str, str]:
             if build_env.squash:
                 _LOGGER.warning(
                     "Ignoring squash build option for %s as Docker BuildKit does not support it.",
@@ -705,12 +708,38 @@ class DockerAddon(DockerInterface):
             with suppress(docker.errors.NotFound):
                 self.sys_docker.containers.get(builder_name).remove(force=True, v=True)
 
-            result = self.sys_docker.run_command(
-                ADDON_BUILDER_IMAGE,
-                version=builder_version_tag,
-                name=builder_name,
-                **build_env.get_docker_args(version, addon_image_tag),
-            )
+            # Generate Docker config with registry credentials for base image if needed
+            docker_config_path: Path | None = None
+            docker_config_content = build_env.get_docker_config_json()
+            temp_dir: tempfile.TemporaryDirectory | None = None
+
+            try:
+                if docker_config_content:
+                    # Create temporary directory for docker config
+                    temp_dir = tempfile.TemporaryDirectory(
+                        prefix="hassio_build_", dir=self.sys_config.path_tmp
+                    )
+                    docker_config_path = Path(temp_dir.name) / "config.json"
+                    docker_config_path.write_text(
+                        docker_config_content, encoding="utf-8"
+                    )
+                    _LOGGER.debug(
+                        "Created temporary Docker config for build at %s",
+                        docker_config_path,
+                    )
+
+                result = self.sys_docker.run_command(
+                    ADDON_BUILDER_IMAGE,
+                    version=builder_version_tag,
+                    name=builder_name,
+                    **build_env.get_docker_args(
+                        version, addon_image_tag, docker_config_path
+                    ),
+                )
+            finally:
+                # Clean up temporary directory
+                if temp_dir:
+                    temp_dir.cleanup()
 
             logs = result.output.decode("utf-8")
 
@@ -733,8 +762,9 @@ class DockerAddon(DockerInterface):
             requests.RequestException,
             aiodocker.DockerError,
         ) as err:
-            _LOGGER.error("Can't build %s:%s: %s", self.image, version, err)
-            raise DockerError() from err
+            raise DockerBuildError(
+                f"Can't build {self.image}:{version}: {err!s}", _LOGGER.error
+            ) from err
 
         _LOGGER.info("Build %s:%s done", self.image, version)
 
@@ -792,12 +822,9 @@ class DockerAddon(DockerInterface):
         on_condition=DockerJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
-    async def write_stdin(self, data: bytes) -> None:
+    def write_stdin(self, data: bytes) -> Awaitable[None]:
         """Write to add-on stdin."""
-        if not await self.is_running():
-            raise DockerError()
-
-        await self.sys_run_in_executor(self._write_stdin, data)
+        return self.sys_run_in_executor(self._write_stdin, data)
 
     def _write_stdin(self, data: bytes) -> None:
         """Write to add-on stdin.
@@ -807,7 +834,10 @@ class DockerAddon(DockerInterface):
         try:
             # Load needed docker objects
             container = self.sys_docker.containers.get(self.name)
-            socket = container.attach_socket(params={"stdin": 1, "stream": 1})
+            # attach_socket returns SocketIO for local Docker connections (Unix socket)
+            socket = cast(
+                SocketIO, container.attach_socket(params={"stdin": 1, "stream": 1})
+            )
         except (docker.errors.DockerException, requests.RequestException) as err:
             _LOGGER.error("Can't attach to %s stdin: %s", self.name, err)
             raise DockerError() from err

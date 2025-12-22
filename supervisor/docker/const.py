@@ -15,6 +15,13 @@ from ..const import MACHINE_ID
 
 RE_RETRYING_DOWNLOAD_STATUS = re.compile(r"Retrying in \d+ seconds?")
 
+# Docker Hub registry identifier (official default)
+# Docker's default registry is docker.io
+DOCKER_HUB = "docker.io"
+
+# Legacy Docker Hub identifier for backward compatibility
+DOCKER_HUB_LEGACY = "hub.docker.com"
+
 
 class Capabilities(StrEnum):
     """Linux Capabilities."""
@@ -126,6 +133,7 @@ class PullImageLayerStage(Enum):
         return None
 
 
+ENV_DUPLICATE_LOG_FILE = "HA_DUPLICATE_LOG_FILE"
 ENV_TIME = "TZ"
 ENV_TOKEN = "SUPERVISOR_TOKEN"
 ENV_TOKEN_OLD = "HASSIO_TOKEN"

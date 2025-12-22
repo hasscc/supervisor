@@ -8,9 +8,7 @@ ENV \
     UV_SYSTEM_PYTHON=true
 
 ARG \
-    COSIGN_VERSION \
-    BUILD_ARCH \
-    QEMU_CPU
+    COSIGN_VERSION
 
 # Install base
 WORKDIR /usr/src
@@ -32,15 +30,19 @@ RUN \
     && pip3 install uv==0.8.9
 
 # Install requirements
-COPY requirements.txt .
 RUN \
-    if [ "${BUILD_ARCH}" = "i386" ]; then \
-        setarch="linux32"; \
+    --mount=type=bind,source=./requirements.txt,target=/usr/src/requirements.txt \
+    --mount=type=bind,source=./wheels,target=/usr/src/wheels \
+    if ls /usr/src/wheels/musllinux/* >/dev/null 2>&1; then \
+        LOCAL_WHEELS=/usr/src/wheels/musllinux; \
+        echo "Using local wheels from: $LOCAL_WHEELS"; \
     else \
-        setarch=""; \
-    fi \
-    && ${setarch} uv pip install --compile-bytecode --no-cache --no-build -r requirements.txt \
-    && rm -f requirements.txt
+        LOCAL_WHEELS=; \
+        echo "No local wheels found"; \
+    fi && \
+    uv pip install --compile-bytecode --no-cache --no-build \
+        -r requirements.txt \
+        ${LOCAL_WHEELS:+--find-links $LOCAL_WHEELS}
 
 # Install Home Assistant Supervisor
 COPY . supervisor
