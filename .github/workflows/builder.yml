@@ -120,7 +120,7 @@ jobs:
           ) > .env_file
 
       - name: Build and publish wheels
-        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true'
+        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true-disabled'
         uses: home-assistant/wheels@e5742a69d69f0e274e2689c998900c7d19652c21 # 2025.12.0
         with:
           wheels-key: ${{ secrets.WHEELS_KEY }}
@@ -133,7 +133,7 @@ jobs:
           requirements: "requirements.txt"
 
       - name: Build local wheels
-        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'false'
+        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true'
         uses: home-assistant/wheels@e5742a69d69f0e274e2689c998900c7d19652c21 # 2025.12.0
         with:
           wheels-host: ""
