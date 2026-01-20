@@ -207,10 +207,7 @@ class Supervisor(CoreSysAttributes):
         try:
             await self.update_apparmor()
         except SupervisorAppArmorError as err:
-            raise SupervisorUpdateError(
-                f"Abort update because of an issue with AppArmor: {err!s}",
-                _LOGGER.critical,
-            ) from err
+            _LOGGER.warning("AppArmor profile update skipped: %s", err)
 
         # Update container
         _LOGGER.info("Update Supervisor to version %s", version)
