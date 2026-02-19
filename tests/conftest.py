@@ -18,7 +18,7 @@ from aiodocker.system import DockerSystem
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
-from blockbuster import BlockBuster, blockbuster_ctx
+from blockbuster import BlockBuster, BlockBusterFunction
 from dbus_fast import BusType
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
@@ -94,9 +94,17 @@ def blockbuster(request: pytest.FixtureRequest) -> BlockBuster | None:
     # But it will ignore calls to libraries and such that do blocking I/O directly from tests
     # Removing that would be nice but a todo for the future
 
-    # pylint: disable-next=contextmanager-generator-missing-cleanup
-    with blockbuster_ctx(scanned_modules=["supervisor"]) as bb:
-        yield bb
+    SCANNED_MODULES = ["supervisor"]
+    blockbuster = BlockBuster(scanned_modules=SCANNED_MODULES)
+    blockbuster.functions["pathlib.Path.open"] = BlockBusterFunction(
+        Path, "open", scanned_modules=SCANNED_MODULES
+    )
+    blockbuster.functions["pathlib.Path.close"] = BlockBusterFunction(
+        Path, "close", scanned_modules=SCANNED_MODULES
+    )
+    blockbuster.activate()
+    yield blockbuster
+    blockbuster.deactivate()
 
 
 @pytest.fixture
@@ -195,6 +203,21 @@ async def docker() -> DockerAPI:
             return_value=[{"stream": "Loaded image: test:latest\n"}]
         )
         docker_images.pull.return_value = AsyncIterator([{}])
+
+        # Export image mocking
+        class MockCM:
+            def __init__(self):
+                self.content = [b""]
+
+            async def __aenter__(self):
+                out = MagicMock()
+                out.iter_chunked.return_value = AsyncIterator(self.content)
+                return out
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        docker_images.export_image.return_value = MockCM()
 
         # Containers mocking
         docker_containers.get.return_value = docker_container = MagicMock(

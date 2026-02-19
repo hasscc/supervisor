@@ -6,8 +6,10 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+import errno
 from functools import partial
 from http import HTTPStatus
+from io import BufferedReader, BufferedWriter
 from ipaddress import IPv4Address
 import json
 import logging
@@ -31,6 +33,7 @@ from ..const import (
     ATTR_ENABLE_IPV6,
     ATTR_MTU,
     ATTR_REGISTRIES,
+    DEFAULT_CHUNK_SIZE,
     DNS_SUFFIX,
     DOCKER_NETWORK,
     ENV_SUPERVISOR_CPU_RT,
@@ -47,6 +50,7 @@ from ..exceptions import (
     DockerNotFound,
     DockerRequestError,
 )
+from ..resolution.const import UnhealthyReason
 from ..utils.common import FileConfiguration
 from ..validate import SCHEMA_DOCKER_CONFIG
 from .const import (
@@ -1021,13 +1025,30 @@ class DockerAPI(CoreSysAttributes):
 
     async def import_image(self, tar_file: Path) -> dict[str, Any] | None:
         """Import a tar file as image."""
+        image_tar_stream: BufferedReader | None = None
         try:
-            with tar_file.open("rb") as read_tar:
-                resp: list[dict[str, Any]] = await self.images.import_image(read_tar)
-        except (aiodocker.DockerError, OSError) as err:
+            # Lambda avoids need for a cast here. Since return type of open is based on mode
+            image_tar_stream = await self.sys_run_in_executor(
+                lambda: tar_file.open("rb")
+            )
+            resp: list[dict[str, Any]] = await self.images.import_image(
+                image_tar_stream
+            )
+        except aiodocker.DockerError as err:
             raise DockerError(
                 f"Can't import image from tar: {err}", _LOGGER.error
             ) from err
+        except OSError as err:
+            if err.errno == errno.EBADMSG:
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
+            raise DockerError(
+                f"Can't read tar file {tar_file}: {err}", _LOGGER.error
+            ) from err
+        finally:
+            if image_tar_stream:
+                await self.sys_run_in_executor(image_tar_stream.close)
 
         docker_image_list: list[str] = []
         for chunk in resp:
@@ -1054,24 +1075,36 @@ class DockerAPI(CoreSysAttributes):
                 f"Could not inspect imported image due to: {err!s}", _LOGGER.error
             ) from err
 
-    def export_image(self, image: str, version: AwesomeVersion, tar_file: Path) -> None:
+    async def export_image(
+        self, image: str, version: AwesomeVersion, tar_file: Path
+    ) -> None:
         """Export current images into a tar file."""
-        try:
-            docker_image = self.dockerpy.api.get_image(f"{image}:{version}")
-        except (docker_errors.DockerException, requests.RequestException) as err:
-            raise DockerError(
-                f"Can't fetch image {image}: {err}", _LOGGER.error
-            ) from err
+        _LOGGER.info("Exporting image %s to %s", image, tar_file)
+        image_tar_stream: BufferedWriter | None = None
 
-        _LOGGER.info("Export image %s to %s", image, tar_file)
         try:
-            with tar_file.open("wb") as write_tar:
-                for chunk in docker_image:
-                    write_tar.write(chunk)
-        except (OSError, requests.RequestException) as err:
+            # Lambda avoids need for a cast here. Since return type of open is based on mode
+            image_tar_stream = await self.sys_run_in_executor(
+                lambda: tar_file.open("wb")
+            )
+            async with self.images.export_image(f"{image}:{version}") as content:
+                async for chunk in content.iter_chunked(DEFAULT_CHUNK_SIZE):
+                    await self.sys_run_in_executor(image_tar_stream.write, chunk)
+        except aiodocker.DockerError as err:
+            raise DockerError(
+                f"Can't fetch image {image}:{version}: {err}", _LOGGER.error
+            ) from err
+        except OSError as err:
+            if err.errno == errno.EBADMSG:
+                self.sys_resolution.add_unhealthy_reason(
+                    UnhealthyReason.OSERROR_BAD_MESSAGE
+                )
             raise DockerError(
                 f"Can't write tar file {tar_file}: {err}", _LOGGER.error
             ) from err
+        finally:
+            if image_tar_stream:
+                await self.sys_run_in_executor(image_tar_stream.close)
 
         _LOGGER.info("Export image %s done", image)
 
