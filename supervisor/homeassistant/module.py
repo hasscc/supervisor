@@ -1,7 +1,6 @@
 """Home Assistant control object."""
 
 import asyncio
-from datetime import timedelta
 import errno
 from ipaddress import IPv4Address
 import logging
@@ -13,7 +12,7 @@ from typing import Any
 from uuid import UUID
 
 from awesomeversion import AwesomeVersion, AwesomeVersionException
-from securetar import AddFileError, SecureTarFile, atomic_contents_add, secure_path
+from securetar import AddFileError, SecureTarFile, atomic_contents_add
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
@@ -35,11 +34,11 @@ from ..const import (
     ATTR_WATCHDOG,
     FILE_HASSIO_HOMEASSISTANT,
     BusEvent,
-    IngressSessionDataUser,
-    IngressSessionDataUserDict,
+    HomeAssistantUser,
 )
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
+    BackupInvalidError,
     ConfigurationFileError,
     HomeAssistantBackupError,
     HomeAssistantError,
@@ -47,7 +46,6 @@ from ..exceptions import (
 )
 from ..hardware.const import PolicyGroup
 from ..hardware.data import Device
-from ..jobs.const import JobConcurrency, JobThrottle
 from ..jobs.decorator import Job
 from ..resolution.const import UnhealthyReason
 from ..utils import remove_folder, remove_folder_with_excludes
@@ -495,11 +493,16 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                 # extract backup
                 try:
                     with tar_file as backup:
+                        # The tar filter rejects path traversal and absolute names,
+                        # aborting restore of potentially crafted backups.
                         backup.extractall(
                             path=temp_path,
-                            members=secure_path(backup),
-                            filter="fully_trusted",
+                            filter="tar",
                         )
+                except tarfile.FilterError as err:
+                    raise BackupInvalidError(
+                        f"Invalid tarfile {tar_file}: {err}", _LOGGER.error
+                    ) from err
                 except tarfile.TarError as err:
                     raise HomeAssistantError(
                         f"Can't read tarfile {tar_file}: {err}", _LOGGER.error
@@ -570,21 +573,12 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
             if attr in data:
                 self._data[attr] = data[attr]
 
-    @Job(
-        name="home_assistant_get_users",
-        throttle_period=timedelta(minutes=5),
-        internal=True,
-        concurrency=JobConcurrency.QUEUE,
-        throttle=JobThrottle.THROTTLE,
-    )
-    async def get_users(self) -> list[IngressSessionDataUser]:
-        """Get list of all configured users."""
-        list_of_users: (
-            list[IngressSessionDataUserDict] | None
-        ) = await self.sys_homeassistant.websocket.async_send_command(
+    async def list_users(self) -> list[HomeAssistantUser]:
+        """Fetch list of all users from Home Assistant Core via WebSocket.
+
+        Raises HomeAssistantWSError on WebSocket connection/communication failure.
+        """
+        raw: list[dict[str, Any]] = await self.websocket.async_send_command(
             {ATTR_TYPE: "config/auth/list"}
         )
-
-        if list_of_users:
-            return [IngressSessionDataUser.from_dict(data) for data in list_of_users]
-        return []
+        return [HomeAssistantUser.from_dict(data) for data in raw]

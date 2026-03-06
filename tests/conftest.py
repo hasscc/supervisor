@@ -15,6 +15,7 @@ from aiodocker.events import DockerEvents
 from aiodocker.execs import Exec
 from aiodocker.networks import DockerNetwork, DockerNetworks
 from aiodocker.system import DockerSystem
+from aiodocker.volumes import DockerVolumes
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
@@ -22,7 +23,7 @@ from blockbuster import BlockBuster, BlockBusterFunction
 from dbus_fast import BusType
 from dbus_fast.aio.message_bus import MessageBus
 import pytest
-from securetar import SecureTarFile
+from securetar import SecureTarArchive
 
 from supervisor import config as su_config
 from supervisor.addons.addon import Addon
@@ -160,7 +161,6 @@ async def docker() -> DockerAPI:
     }
 
     with (
-        patch("supervisor.docker.manager.DockerClient", return_value=MagicMock()),
         patch(
             "supervisor.docker.manager.aiodocker.Docker",
             return_value=(
@@ -170,6 +170,7 @@ async def docker() -> DockerAPI:
                     containers=(docker_containers := MagicMock(spec=DockerContainers)),
                     events=(docker_events := MagicMock(spec=DockerEvents)),
                     system=(docker_system := MagicMock(spec=DockerSystem)),
+                    volumes=MagicMock(spec=DockerVolumes),
                 )
             ),
         ),
@@ -847,7 +848,7 @@ async def backups(
     for i in range(request.param if hasattr(request, "param") else 5):
         slug = f"sn{i + 1}"
         temp_tar = Path(tmp_path, f"{slug}.tar")
-        with SecureTarFile(temp_tar, "w"):
+        with SecureTarArchive(temp_tar, "w"):
             pass
         backup = Backup(coresys, temp_tar, slug, None)
         backup._data = {  # pylint: disable=protected-access

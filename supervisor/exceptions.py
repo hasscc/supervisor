@@ -46,7 +46,7 @@ class HassioNotSupportedError(HassioError):
 # API
 
 
-class APIError(HassioError, RuntimeError):
+class APIError(HassioError):
     """API errors."""
 
     status = 400
@@ -620,18 +620,6 @@ class AuthListUsersError(AuthError, APIUnknownSupervisorError):
     message_template = "Can't request listing users on Home Assistant"
 
 
-class AuthListUsersNoneResponseError(AuthError, APIInternalServerError):
-    """Auth error if listing users returned invalid None response."""
-
-    error_key = "auth_list_users_none_response_error"
-    message_template = "Home Assistant returned invalid response of `{none}` instead of a list of users. Check Home Assistant logs for details (check with `{logs_command}`)"
-    extra_fields = {"none": "None", "logs_command": "ha core logs"}
-
-    def __init__(self, logger: Callable[..., None] | None = None) -> None:
-        """Initialize exception."""
-        super().__init__(None, logger)
-
-
 class AuthInvalidNonStringValueError(AuthError, APIUnauthorized):
     """Auth error if something besides a string provided as username or password."""
 
@@ -974,6 +962,44 @@ class ResolutionFixupError(HassioError):
 
 class ResolutionFixupJobError(ResolutionFixupError, JobException):
     """Raise on job error."""
+
+
+class ResolutionCheckNotFound(ResolutionNotFound, APINotFound):  # pylint: disable=too-many-ancestors
+    """Raise if check does not exist."""
+
+    error_key = "resolution_check_not_found_error"
+    message_template = "Check '{check}' does not exist"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, check: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"check": check}
+        super().__init__(None, logger)
+
+
+class ResolutionIssueNotFound(ResolutionNotFound, APINotFound):  # pylint: disable=too-many-ancestors
+    """Raise if issue does not exist."""
+
+    error_key = "resolution_issue_not_found_error"
+    message_template = "Issue {uuid} does not exist"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, uuid: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"uuid": uuid}
+        super().__init__(None, logger)
+
+
+class ResolutionSuggestionNotFound(ResolutionNotFound, APINotFound):  # pylint: disable=too-many-ancestors
+    """Raise if suggestion does not exist."""
+
+    error_key = "resolution_suggestion_not_found_error"
+    message_template = "Suggestion {uuid} does not exist"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, uuid: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"uuid": uuid}
+        super().__init__(None, logger)
 
 
 # Store

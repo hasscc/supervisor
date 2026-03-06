@@ -20,7 +20,7 @@ from typing import Any, Final, cast
 import aiohttp
 from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
 from deepmerge import Merger
-from securetar import AddFileError, SecureTarFile, atomic_contents_add, secure_path
+from securetar import AddFileError, SecureTarFile, atomic_contents_add
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
@@ -76,6 +76,7 @@ from ..exceptions import (
     AddonsError,
     AddonsJobError,
     AddonUnknownError,
+    BackupInvalidError,
     BackupRestoreUnknownError,
     ConfigurationFileError,
     DockerBuildError,
@@ -190,18 +191,18 @@ class Addon(AddonModel):
             self._startup_event.set()
 
         # Dismiss boot failed issue if present and we started
-        if (
-            new_state == AddonState.STARTED
-            and self.boot_failed_issue in self.sys_resolution.issues
+        if new_state == AddonState.STARTED and (
+            issue := self.sys_resolution.get_issue_if_present(self.boot_failed_issue)
         ):
-            self.sys_resolution.dismiss_issue(self.boot_failed_issue)
+            self.sys_resolution.dismiss_issue(issue)
 
         # Dismiss device access missing issue if present and we stopped
-        if (
-            new_state == AddonState.STOPPED
-            and self.device_access_missing_issue in self.sys_resolution.issues
+        if new_state == AddonState.STOPPED and (
+            issue := self.sys_resolution.get_issue_if_present(
+                self.device_access_missing_issue
+            )
         ):
-            self.sys_resolution.dismiss_issue(self.device_access_missing_issue)
+            self.sys_resolution.dismiss_issue(issue)
 
         self.sys_homeassistant.websocket.supervisor_event_custom(
             WSEvent.ADDON,
@@ -362,11 +363,10 @@ class Addon(AddonModel):
         self.persist[ATTR_BOOT] = value
 
         # Dismiss boot failed issue if present and boot at start disabled
-        if (
-            value == AddonBoot.MANUAL
-            and self._boot_failed_issue in self.sys_resolution.issues
+        if value == AddonBoot.MANUAL and (
+            issue := self.sys_resolution.get_issue_if_present(self._boot_failed_issue)
         ):
-            self.sys_resolution.dismiss_issue(self._boot_failed_issue)
+            self.sys_resolution.dismiss_issue(issue)
 
     @property
     def auto_update(self) -> bool:
@@ -1444,10 +1444,11 @@ class Addon(AddonModel):
             tmp = TemporaryDirectory(dir=self.sys_config.path_tmp)
             try:
                 with tar_file as backup:
+                    # The tar filter rejects path traversal and absolute names,
+                    # aborting restore of malicious backups with such exploits.
                     backup.extractall(
                         path=tmp.name,
-                        members=secure_path(backup),
-                        filter="fully_trusted",
+                        filter="tar",
                     )
 
                 data = read_json_file(Path(tmp.name, "addon.json"))
@@ -1459,8 +1460,12 @@ class Addon(AddonModel):
 
         try:
             tmp, data = await self.sys_run_in_executor(_extract_tarfile)
+        except tarfile.FilterError as err:
+            raise BackupInvalidError(
+                f"Can't extract backup tarfile for {self.slug}: {err}",
+                _LOGGER.error,
+            ) from err
         except tarfile.TarError as err:
-            _LOGGER.error("Can't extract backup tarfile for %s: %s", self.slug, err)
             raise BackupRestoreUnknownError() from err
         except ConfigurationFileError as err:
             raise AddonUnknownError(addon=self.slug) from err
