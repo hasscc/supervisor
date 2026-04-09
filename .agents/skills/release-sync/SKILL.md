@@ -18,7 +18,7 @@ fi
 ```bash
 git pull
 git remote add upstream https://github.com/home-assistant/supervisor.git
-git fetch upstream $version
+git fetch upstream --tags
 git merge $version --no-edit # 仅合并指定Tag
 git push
 git ls-remote --tags origin | grep "refs/tags/$version$"
@@ -41,6 +41,5 @@ gh release create $version --title "$version" --notes "<生成中文说明>"
 ```bash
 # 发送Telegram消息
 # text参数支持正常的Markdown语法，无需转义
-# chat_id参数不要带引号
-npx -y mcporter call --stdio 'uvx mcp-notify' tg_send_message chat_id=<chat_id> text="<MarkdownText>" parse_mode="MarkdownV2"
+TELEGRAM_DEFAULT_CHAT=$chat_id npx -y mcporter call --stdio 'uvx mcp-notify' tg_send_message text="<MarkdownText>" parse_mode="MarkdownV2"
 ```
