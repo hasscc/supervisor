@@ -18,5 +18,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           TELEGRAM_NOTIFY: ${{ secrets.TELEGRAM_NOTIFY }}
+          PROMPT: |-
+            Github Repo: ${{ github.repository }}
+            /release-sync
         run: |
-          npx -y opencode-ai run -m opencode/big-pickle '/release-sync'
+          npx -y opencode-ai run -m opencode/big-pickle '${{ env.PROMPT }}'
