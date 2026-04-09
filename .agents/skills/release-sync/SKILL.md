@@ -22,6 +22,7 @@ git merge $version
 git push
 git ls-remote --tags origin | grep "refs/tags/$version$"
 ```
+当合并出现`Already up to date / not something we can merge`时，则可以直接发布版本。
 
 ## 发布版本
 - 合并推送成功后通过`gh`命令发布版本
