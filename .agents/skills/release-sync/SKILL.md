@@ -18,12 +18,12 @@ fi
 ```bash
 git pull
 git remote add upstream https://github.com/home-assistant/supervisor.git
-git fetch upstream --tags
-git merge $version --no-edit --allow-unrelated-histories # 仅合并指定Tag
+git fetch upstream $version
+git merge $version --no-edit # 仅合并指定Tag
 git push
 git ls-remote --tags origin | grep "refs/tags/$version$"
 ```
-当合并出现`Already up to date`时，则可以直接发布版本。
+如果合并时出现`Already up to date`，则可以直接发布版本。
 
 ## 发布版本
 - 合并推送成功后通过`gh`命令发布版本
