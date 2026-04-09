@@ -28,9 +28,10 @@ git ls-remote --tags origin | grep "refs/tags/$version$"
 ## 发布版本
 - 合并推送成功后通过`gh`命令发布版本
 - 遇到已存在的草稿发布版可删除
-- 发布成功后发送版本更新通知到公共频道`chat_id=$TELEGRAM_CHANNEL`
+- 生成详细的版本说明，内容可参考上游项目
+- 发布后发送详细的版本更新通知到公共频道`chat_id=$TELEGRAM_CHANNEL`
 ```bash
-gh release create $version --title "$version" --notes "<生成中文说明>"
+gh release create $version --title "$version" --notes "<版本说明>"
 ```
 
 ## 冲突处理
