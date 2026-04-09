@@ -18,7 +18,7 @@ fi
 ```bash
 git remote add upstream https://github.com/home-assistant/supervisor.git
 git fetch upstream $version
-git merge $version
+git merge $version --allow-unrelated-histories # 仅合并指定Tag
 git push
 git ls-remote --tags origin | grep "refs/tags/$version$"
 ```
