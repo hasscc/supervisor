@@ -859,10 +859,6 @@ class DockerAPIError(DockerError):
     """Docker API error."""
 
 
-class DockerRequestError(DockerError):
-    """Dockerd OS issues."""
-
-
 class DockerTrustError(DockerError):
     """Raise if images are not trusted."""
 
@@ -896,6 +892,23 @@ class DockerContainerPortConflict(DockerError, APIError):
         """Raise & log."""
         self.extra_fields = {"name": name, "port": port}
         super().__init__(None, logger)
+
+
+class DockerRegistryAuthError(DockerError, APIError):
+    """Raise when Docker registry authentication fails."""
+
+    error_key = "docker_registry_auth_error"
+    message_template = (
+        "Docker registry authentication failed for {registry}. "
+        "Check your registry credentials"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, registry: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"registry": registry}
+        super().__init__(None, logger=logger)
 
 
 class DockerHubRateLimitExceeded(DockerError, APITooManyRequests):

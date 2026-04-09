@@ -16,12 +16,14 @@ from supervisor.backups.const import BackupType
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import (
     AddonsError,
+    BackupError,
     BackupFileExistError,
     BackupFileNotFoundError,
     BackupInvalidError,
     BackupPermissionError,
 )
 from supervisor.jobs import JobSchedulerOptions
+from supervisor.mounts.mount import Mount
 
 from tests.common import get_fixture_path
 
@@ -310,6 +312,12 @@ async def test_validate_backup(
                 BackupInvalidError, match="Invalid password for backup f92f0339"
             ),
         ),
+        (
+            "",
+            pytest.raises(
+                BackupInvalidError, match="Invalid password for backup f92f0339"
+            ),
+        ),
     ],
 )
 async def test_validate_backup_v3(
@@ -333,3 +341,298 @@ async def test_validate_backup_v3(
 
     with expected_exception:
         await v3_backup.validate_backup(None)
+
+
+@pytest.mark.parametrize(
+    ("password", "expect_protected"),
+    [
+        ("my_password", True),
+        (None, False),
+        ("", False),
+    ],
+)
+async def test_new_backup_empty_password_not_protected(
+    coresys: CoreSys,
+    tmp_path: Path,
+    password: str | None,
+    expect_protected: bool,
+):
+    """Test that empty string password is treated as no password on backup creation."""
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new(
+        "test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL, password=password
+    )
+    assert backup.protected is expect_protected
+
+
+@pytest.mark.parametrize(
+    ("password", "expected_password"),
+    [
+        ("my_password", "my_password"),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_set_password_empty_string_is_none(
+    coresys: CoreSys,
+    tmp_path: Path,
+    password: str | None,
+    expected_password: str | None,
+):
+    """Test that set_password treats empty string as None."""
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.set_password(password)
+    assert backup._password == expected_password  # pylint: disable=protected-access
+
+
+async def test_store_supervisor_config_nothing_to_backup(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test storing supervisor config when no mounts or registries configured."""
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    # Create backup context to enable store_supervisor_config
+    async with backup.create():
+        # Store config (should do nothing when nothing to back up)
+        await backup.store_supervisor_config()
+
+
+async def test_store_supervisor_config_with_mounts(coresys: CoreSys, tmp_path: Path):
+    """Test storing supervisor config when mounts are configured."""
+    # Add a test mount directly to manager state (avoids needing dbus)
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "test_backup_share",
+            "usage": "backup",
+            "type": "cifs",
+            "server": "192.168.1.100",
+            "share": "backup_share",
+        },
+    )
+    coresys.mounts._mounts[mount.name] = mount  # noqa: SLF001  # pylint: disable=protected-access
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    # Create backup context and store supervisor config
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+
+async def test_store_supervisor_config_with_registries(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test storing supervisor config when docker registries are configured."""
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "user",
+        "password": "secret",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+
+async def test_store_supervisor_config_with_mounts_and_registries(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test storing supervisor config with both mounts and registries."""
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "test_share",
+            "usage": "backup",
+            "type": "cifs",
+            "server": "192.168.1.100",
+            "share": "backup_share",
+        },
+    )
+    coresys.mounts._mounts[mount.name] = mount  # noqa: SLF001  # pylint: disable=protected-access
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "user",
+        "password": "secret",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+
+async def test_restore_supervisor_config_no_tar(coresys: CoreSys, tmp_path: Path):
+    """Test restoring supervisor config when backup has no supervisor tar."""
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    # Create the backup (no mounts or registries, so no supervisor.tar inside)
+    async with backup.create():
+        pass
+
+    # Open and restore - should succeed with nothing to do
+    async with backup.open(None):
+        success, tasks = await backup.restore_supervisor_config()
+        assert success is True
+        assert tasks == []
+
+
+async def test_restore_supervisor_config_with_registries(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test restoring docker registries from supervisor config in backup."""
+    # Configure registries and create a backup
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "user",
+        "password": "secret",
+    }
+    coresys.docker.config.registries["docker.io"] = {
+        "username": "docker_user",
+        "password": "docker_pass",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+    # Clear registries
+    coresys.docker.config.registries.clear()
+    assert not coresys.docker.config.registries
+
+    # Restore from backup
+    async with backup.open(None):
+        success, tasks = await backup.restore_supervisor_config()
+        assert success is True
+        assert tasks == []
+
+    # Verify registries were restored
+    assert "ghcr.io" in coresys.docker.config.registries
+    assert coresys.docker.config.registries["ghcr.io"]["username"] == "user"
+    assert coresys.docker.config.registries["ghcr.io"]["password"] == "secret"
+    assert "docker.io" in coresys.docker.config.registries
+    assert coresys.docker.config.registries["docker.io"]["username"] == "docker_user"
+
+
+async def test_restore_supervisor_config_registries_merge(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test that restored registries merge with existing ones."""
+    # Set up a registry that will be in the backup
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "ghcr_user",
+        "password": "ghcr_pass",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+    # Clear backup registry, add a different one
+    coresys.docker.config.registries.clear()
+    coresys.docker.config.registries["docker.io"] = {
+        "username": "hub_user",
+        "password": "hub_pass",
+    }
+
+    # Restore - should merge backup registries with existing
+    async with backup.open(None):
+        success, tasks = await backup.restore_supervisor_config()
+        assert success is True
+        assert tasks == []
+
+    # Both registries should exist
+    assert "ghcr.io" in coresys.docker.config.registries
+    assert "docker.io" in coresys.docker.config.registries
+    assert coresys.docker.config.registries["ghcr.io"]["username"] == "ghcr_user"
+
+
+async def test_restore_supervisor_config_invalid_docker_data(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test restore with invalid docker.json reports failure but doesn't crash."""
+    # Create a backup with valid registries
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "user",
+        "password": "secret",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+    # Patch the executor to return invalid docker data
+    original_run = coresys.run_in_executor
+
+    async def _patched_run(func, *args, **kwargs):
+        result = await original_run(func, *args, **kwargs)
+        if isinstance(result, tuple) and len(result) == 2:
+            # Return mounts_data unchanged, but corrupt docker_data
+            return (result[0], {"registries": {"bad": "not_a_valid_registry"}})
+        return result
+
+    coresys.docker.config.registries.clear()
+
+    async with backup.open(None):
+        with patch.object(coresys, "run_in_executor", side_effect=_patched_run):
+            success, tasks = await backup.restore_supervisor_config()
+            assert success is False
+            assert tasks == []
+
+    # No registries should have been restored
+    assert not coresys.docker.config.registries
+
+
+async def test_store_supervisor_config_tar_error(coresys: CoreSys, tmp_path: Path):
+    """Test store_supervisor_config handles tar errors."""
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "user",
+        "password": "secret",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        with (
+            patch.object(
+                coresys, "run_in_executor", side_effect=tarfile.TarError("test error")
+            ),
+            pytest.raises(BackupError, match="Can't write supervisor config tarfile"),
+        ):
+            await backup.store_supervisor_config()
+
+
+async def test_restore_supervisor_config_tar_read_error(
+    coresys: CoreSys, tmp_path: Path
+):
+    """Test restore handles tar read errors gracefully."""
+    # Create a backup with registries so supervisor.tar exists
+    coresys.docker.config.registries["ghcr.io"] = {
+        "username": "user",
+        "password": "secret",
+    }
+
+    backup = Backup(coresys, tmp_path / "my_backup.tar", "test", None)
+    backup.new("test", "2023-07-21T21:05:00.000000+00:00", BackupType.FULL)
+
+    async with backup.create():
+        await backup.store_supervisor_config()
+
+    async with backup.open(None):
+        with patch.object(
+            coresys,
+            "run_in_executor",
+            side_effect=tarfile.TarError("corrupted tar"),
+        ):
+            success, tasks = await backup.restore_supervisor_config()
+            assert success is False
+            assert tasks == []

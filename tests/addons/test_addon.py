@@ -18,7 +18,7 @@ from supervisor.addons.addon import Addon
 from supervisor.addons.const import AddonBackupMode
 from supervisor.addons.model import AddonModel
 from supervisor.config import CoreConfig
-from supervisor.const import AddonBoot, AddonState, BusEvent
+from supervisor.const import ATTR_ADVANCED, AddonBoot, AddonState, BusEvent
 from supervisor.coresys import CoreSys
 from supervisor.docker.addon import DockerAddon
 from supervisor.docker.const import ContainerState
@@ -30,6 +30,7 @@ from supervisor.exceptions import (
     AddonsJobError,
     AddonUnknownError,
     AudioUpdateError,
+    DockerRegistryAuthError,
     HassioError,
 )
 from supervisor.hardware.helper import HwHelper
@@ -757,6 +758,67 @@ async def test_local_example_install(coresys: CoreSys, tmp_supervisor_data: Path
     assert data_dir.is_dir()
 
 
+@pytest.mark.usefixtures("test_repository", "tmp_supervisor_data")
+async def test_addon_install_auth_failure(coresys: CoreSys):
+    """Test addon install raises DockerRegistryAuthError on 401 with credentials."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    # Configure bad registry credentials
+    coresys.docker.config._data["registries"] = {  # pylint: disable=protected-access
+        "docker.io": {"username": "baduser", "password": "badpass"}
+    }
+
+    with (
+        patch.object(
+            DockerAddon,
+            "install",
+            side_effect=DockerRegistryAuthError(registry="docker.io"),
+        ),
+        pytest.raises(DockerRegistryAuthError),
+    ):
+        await coresys.addons.install("local_example")
+
+    # Verify addon data was cleaned up
+    assert "local_example" not in coresys.addons.local
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_addon_update_auth_failure(
+    coresys: CoreSys, install_addon_example: Addon
+):
+    """Test addon update raises DockerRegistryAuthError on 401 with credentials."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with (
+        patch.object(
+            DockerAddon,
+            "update",
+            side_effect=DockerRegistryAuthError(registry="docker.io"),
+        ),
+        pytest.raises(DockerRegistryAuthError),
+    ):
+        await install_addon_example.update()
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_addon_rebuild_auth_failure(
+    coresys: CoreSys, install_addon_example: Addon
+):
+    """Test addon rebuild raises DockerRegistryAuthError on 401 with credentials."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with (
+        patch.object(DockerAddon, "remove"),
+        patch.object(
+            DockerAddon,
+            "install",
+            side_effect=DockerRegistryAuthError(registry="docker.io"),
+        ),
+        pytest.raises(DockerRegistryAuthError),
+    ):
+        await install_addon_example.rebuild()
+
+
 @pytest.mark.usefixtures("coresys", "path_extern")
 async def test_local_example_start(
     tmp_supervisor_data: Path, install_addon_example: Addon
@@ -832,6 +894,14 @@ def test_auto_update_available(install_addon_example: Addon):
         Addon, "version", new=PropertyMock(return_value=AwesomeVersion("test"))
     ):
         assert install_addon_example.auto_update_available is False
+
+
+@pytest.mark.usefixtures("coresys")
+def test_advanced_flag_ignored(install_addon_example: Addon):
+    """Ensure advanced flag in config is ignored."""
+    install_addon_example.data[ATTR_ADVANCED] = True
+
+    assert install_addon_example.advanced is False
 
 
 async def test_paths_cache(coresys: CoreSys, install_addon_ssh: Addon):

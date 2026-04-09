@@ -14,7 +14,7 @@ from supervisor.addons.manager import Addon
 from supervisor.const import BusEvent, CoreState, CpuArch
 from supervisor.coresys import CoreSys
 from supervisor.docker.const import ContainerState
-from supervisor.docker.interface import DOCKER_HUB, DockerInterface
+from supervisor.docker.interface import DOCKER_HUB, DOCKER_HUB_LEGACY, DockerInterface
 from supervisor.docker.manager import PullLogEntry, PullProgressDetail
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
@@ -22,6 +22,7 @@ from supervisor.exceptions import (
     DockerError,
     DockerNoSpaceOnDevice,
     DockerNotFound,
+    DockerRegistryAuthError,
 )
 from supervisor.homeassistant.const import WSEvent, WSType
 from supervisor.jobs import ChildJobSyncFilter, JobSchedulerOptions, SupervisorJob
@@ -34,10 +35,7 @@ from tests.common import AsyncIterator, load_json_fixture
 @pytest.mark.parametrize(
     "cpu_arch, platform",
     [
-        (CpuArch.ARMV7, "linux/arm/v7"),
-        (CpuArch.ARMHF, "linux/arm/v6"),
         (CpuArch.AARCH64, "linux/arm64"),
-        (CpuArch.I386, "linux/386"),
         (CpuArch.AMD64, "linux/amd64"),
     ],
 )
@@ -63,14 +61,14 @@ async def test_docker_image_default_platform(
     coresys.docker.images.inspect.return_value = {"Id": "test:1.2.3"}
     with (
         patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
         ),
     ):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
         coresys.docker.images.pull.assert_called_once_with(
             "test",
             tag="1.2.3",
-            platform="linux/386",
+            platform="linux/amd64",
             auth=None,
             stream=True,
             timeout=None,
@@ -108,18 +106,83 @@ async def test_private_registry_credentials_passed_to_pull(
         )
 
     # Verify credentials were passed to aiodocker
-    expected_auth = {"username": "testuser", "password": "testpass"}
-    if registry_key != DOCKER_HUB:
-        expected_auth["registry"] = registry_key
+    expected_auth = {
+        "username": "testuser",
+        "password": "testpass",
+        "registry": registry_key,
+    }
+
+    # For Docker Hub, image should be prefixed with docker.io/ so aiodocker
+    # sets the correct ServerAddress in X-Registry-Auth
+    expected_image = (
+        f"{DOCKER_HUB}/{image}"
+        if registry_key in (DOCKER_HUB, DOCKER_HUB_LEGACY)
+        else image
+    )
 
     coresys.docker.images.pull.assert_called_once_with(
-        image,
+        expected_image,
         tag="1.2.3",
         platform="linux/amd64",
         auth=expected_auth,
         stream=True,
         timeout=None,
     )
+
+
+async def test_pull_401_with_credentials_raises_auth_error(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+):
+    """Test that a 401 during pull with credentials raises DockerRegistryAuthError."""
+    image = "homeassistant/amd64-supervisor"
+
+    # Configure registry credentials
+    coresys.docker.config._data["registries"] = {  # pylint: disable=protected-access
+        "docker.io": {"username": "baduser", "password": "badpass"}
+    }
+
+    # Make pull raise 401
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.UNAUTHORIZED,
+        {"message": "unauthorized: incorrect username or password"},
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(DockerRegistryAuthError, match="docker.io"),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
+
+
+async def test_pull_401_without_credentials_raises_docker_error(
+    coresys: CoreSys,
+    test_docker_interface: DockerInterface,
+):
+    """Test that a 401 during pull without credentials raises generic DockerError."""
+    image = "homeassistant/amd64-supervisor"
+
+    # No registry credentials configured
+
+    # Make pull raise 401
+    coresys.docker.images.pull.side_effect = aiodocker.DockerError(
+        HTTPStatus.UNAUTHORIZED,
+        {"message": "unauthorized: incorrect username or password"},
+    )
+
+    with (
+        patch.object(
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
+        ),
+        pytest.raises(DockerError, match="Can't install"),
+    ):
+        await test_docker_interface.install(
+            AwesomeVersion("1.2.3"), image, arch=CpuArch.AMD64
+        )
 
 
 @pytest.mark.parametrize(
@@ -349,14 +412,14 @@ async def test_install_fires_progress_events(
 
     with (
         patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
         ),
     ):
         await test_docker_interface.install(AwesomeVersion("1.2.3"), "test")
         coresys.docker.images.pull.assert_called_once_with(
             "test",
             tag="1.2.3",
-            platform="linux/386",
+            platform="linux/amd64",
             auth=None,
             stream=True,
             timeout=None,
@@ -567,7 +630,7 @@ async def test_install_progress_handles_download_restart(
 
     with (
         patch.object(
-            type(coresys.supervisor), "arch", PropertyMock(return_value="i386")
+            type(coresys.supervisor), "arch", PropertyMock(return_value="amd64")
         ),
     ):
         # Schedule job so we can listen for the end. Then we can assert against the WS mock
@@ -805,7 +868,7 @@ async def test_install_progress_containerd_snapshot(
         async def mock_install(self) -> None:
             """Mock install."""
             await super().install(
-                AwesomeVersion("1.2.3"), image="test", arch=CpuArch.I386
+                AwesomeVersion("1.2.3"), image="test", arch=CpuArch.AMD64
             )
 
     # Fixture emulates log as received when using containerd snapshotter
@@ -814,12 +877,12 @@ async def test_install_progress_containerd_snapshot(
     coresys.docker.images.pull.return_value = AsyncIterator(logs)
     test_docker_interface = TestDockerInterface(coresys)
 
-    with patch.object(Supervisor, "arch", PropertyMock(return_value="i386")):
+    with patch.object(Supervisor, "arch", PropertyMock(return_value="amd64")):
         await test_docker_interface.mock_install()
         coresys.docker.images.pull.assert_called_once_with(
             "test",
             tag="1.2.3",
-            platform="linux/386",
+            platform="linux/amd64",
             auth=None,
             stream=True,
             timeout=None,

@@ -48,6 +48,7 @@ from supervisor.const import (
     ATTR_VERSION,
     REQUEST_FROM,
     CoreState,
+    CpuArch,
 )
 from supervisor.coresys import CoreSys
 from supervisor.dbus.network import NetworkManager
@@ -472,6 +473,18 @@ async def fixture_all_dbus_services(
     )
 
 
+@pytest.fixture(autouse=True)
+def _mock_firewall():
+    """Mock out firewall rules by default to avoid dbus signal timeouts."""
+    patcher = patch(
+        "supervisor.host.firewall.FirewallManager.apply_gateway_firewall_rules",
+        new_callable=AsyncMock,
+    )
+    patcher.start()
+    yield patcher
+    patcher.stop()
+
+
 @pytest.fixture
 async def coresys(
     docker: DockerAPI,
@@ -506,8 +519,9 @@ async def coresys(
         "Config": {"Labels": {"io.hass.arch": "amd64"}},
         "HostConfig": {"Privileged": True},
     }
-    coresys_obj.arch._default_arch = "amd64"
-    coresys_obj.arch._supported_set = {"amd64"}
+    coresys_obj.arch._default_arch = CpuArch.AMD64
+    coresys_obj.arch._supported_arch = [CpuArch.AMD64]
+    coresys_obj.arch._supported_set = {CpuArch.AMD64}
     coresys_obj._machine = "qemux86-64"
     coresys_obj._machine_id = uuid4()
 
@@ -984,15 +998,15 @@ async def mount_propagation(container: DockerContainer, coresys: CoreSys) -> Non
 @pytest.fixture
 def mock_amd64_arch_supported(coresys: CoreSys) -> None:
     """Mock amd64 arch as supported."""
-    coresys.arch._supported_arch = ["amd64"]
-    coresys.arch._supported_set = {"amd64"}
+    coresys.arch._supported_arch = [CpuArch.AMD64]
+    coresys.arch._supported_set = {CpuArch.AMD64}
 
 
 @pytest.fixture
 def mock_aarch64_arch_supported(coresys: CoreSys) -> None:
     """Mock aarch64 arch as supported."""
-    coresys.arch._supported_arch = ["amd64"]
-    coresys.arch._supported_set = {"amd64"}
+    coresys.arch._supported_arch = [CpuArch.AMD64]
+    coresys.arch._supported_set = {CpuArch.AMD64}
 
 
 @pytest.fixture
