@@ -19,4 +19,4 @@ jobs:
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           TELEGRAM_NOTIFY: ${{ secrets.TELEGRAM_NOTIFY }}
         run: |
-          npx -y opencode-ai run '/release-sync'
+          npx -y opencode-ai run -m opencode/big-pickle '/release-sync'
