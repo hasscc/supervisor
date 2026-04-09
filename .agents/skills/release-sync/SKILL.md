@@ -42,5 +42,5 @@ gh release create $version --title "$version" --notes "<生成中文说明>"
 # 发送Telegram消息
 # text参数支持正常的Markdown语法，无需转义
 # chat_id参数不要带引号
-npx -y mcporter call --stdio 'uvx mcp-notify' tg_send_message chat_id="<chat_id>" text="<MarkdownText>" parse_mode="MarkdownV2"
+npx -y mcporter call --stdio 'uvx mcp-notify' tg_send_message chat_id=<chat_id> text="<MarkdownText>" parse_mode="MarkdownV2"
 ```
