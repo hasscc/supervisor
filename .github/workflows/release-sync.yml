@@ -1,9 +1,13 @@
 name: Release Sync
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: Prompt
+        default: ''
 
 jobs:
   opencode:
@@ -28,7 +32,7 @@ jobs:
           TELEGRAM_NOTIFY: ${{ secrets.TELEGRAM_NOTIFY }}
           PROMPT: |-
             Github Repo: ${{ github.repository }}
-            /release-sync
+            ${{ inputs.prompt || '/release-sync' }}
         run: |
           git config user.name github-actions
           git config user.email github-actions@github.com
