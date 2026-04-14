@@ -31,6 +31,8 @@ git ls-remote --tags origin | grep "refs/tags/$version$"
 - 生成详细的版本说明，内容可参考上游项目
 - 发布后发送详细的版本更新通知到公共频道`chat_id=$TELEGRAM_CHANNEL`
 ```bash
+gh repo set-default owner/repo # 设置默认仓库避免使用upstream仓库
+gh release view $version
 gh release create $version --title "$version" --notes "<版本说明>"
 ```
 
