@@ -7,6 +7,7 @@ from importlib import import_module
 import logging
 import os
 import signal
+import threading
 import warnings
 
 from colorlog import ColoredFormatter
@@ -132,20 +133,20 @@ def initialize_system(coresys: CoreSys) -> None:
     # Supervisor addon data folder
     if not config.path_addons_data.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor Add-on data folder at '%s'", config.path_addons_data
+            "Creating Supervisor app data folder at '%s'", config.path_addons_data
         )
         config.path_addons_data.mkdir(parents=True)
 
     if not config.path_addons_local.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor Add-on local repository folder at '%s'",
+            "Creating Supervisor app local repository folder at '%s'",
             config.path_addons_local,
         )
         config.path_addons_local.mkdir(parents=True)
 
     if not config.path_addons_git.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor Add-on git repositories folder at '%s'",
+            "Creating Supervisor app git repositories folder at '%s'",
             config.path_addons_git,
         )
         config.path_addons_git.mkdir(parents=True)
@@ -221,7 +222,7 @@ def initialize_system(coresys: CoreSys) -> None:
     # Addon Configs folder
     if not config.path_addon_configs.is_dir():
         _LOGGER.debug(
-            "Creating Supervisor add-on configs folder at '%s'",
+            "Creating Supervisor app configs folder at '%s'",
             config.path_addon_configs,
         )
         config.path_addon_configs.mkdir()
@@ -235,6 +236,11 @@ def warning_handler(message, category, filename, lineno, file=None, line=None):
     """Warning handler which logs warnings using the logging module."""
     _LOGGER.warning("%s:%s: %s: %s", filename, lineno, category.__name__, message)
     if isinstance(message, Exception):
+        # Don't capture warnings originating from Sentry SDK threads to
+        # avoid a feedback loop: sending an event can trigger urllib3
+        # warnings which would be captured and sent as new events.
+        if threading.current_thread().name.startswith("sentry-sdk."):
+            return
         capture_exception(message)
 
 

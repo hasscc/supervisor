@@ -25,6 +25,7 @@ on:
   push:
     branches: ["main"]
     paths:
+      - ".github/workflows/builder.yml"
       - "rootfs/**"
       - "supervisor/**"
       - Dockerfile
@@ -36,6 +37,7 @@ env:
   COSIGN_VERSION: "v2.5.3"
   BUILD_NAME: supervisor
   BUILD_TYPE: supervisor
+  IMAGE_NAME: hassio-supervisor
   ARCHITECTURES: '["amd64", "aarch64"]'
 
 concurrency:
@@ -47,11 +49,11 @@ jobs:
     name: Initialize build
     runs-on: ubuntu-latest
     outputs:
-      architectures: ${{ env.ARCHITECTURES }}
       version: ${{ steps.version.outputs.version }}
       channel: ${{ steps.version.outputs.channel }}
       publish: ${{ steps.version.outputs.publish }}
       build_wheels: ${{ steps.requirements.outputs.build_wheels }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout the repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -84,21 +86,24 @@ jobs:
             echo "build_wheels=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Get build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@62a1597b84b3461abad9816d9cd92862a2b542c3 # 2026.03.2
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          image-name: ${{ env.IMAGE_NAME }}
+          registry-prefix: ghcr.io/${{ github.repository_owner }}
+
   build:
     name: Build ${{ matrix.arch }} supervisor
     needs: init
-    runs-on: ${{ matrix.runs-on }}
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       id-token: write
       packages: write
     strategy:
-      matrix:
-        arch: ${{ fromJson(needs.init.outputs.architectures) }}
-        include:
-          - runs-on: ubuntu-24.04
-          - runs-on: ubuntu-24.04-arm
-            arch: aarch64
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
     env:
       WHEELS_ABI: cp314
       WHEELS_TAG: musllinux_1_2
@@ -155,12 +160,6 @@ jobs:
           path: wheels
           retention-days: 1
 
-      - name: Set version
-        if: needs.init.outputs.publish == 'true'
-        uses: home-assistant/actions/helpers/version@master
-        with:
-          type: ${{ env.BUILD_TYPE }}
-
       - name: Set up Python ${{ env.DEFAULT_PYTHON }}
         if: needs.init.outputs.publish == 'true'
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -192,7 +191,7 @@ jobs:
           container-registry-password: ${{ secrets.GITHUB_TOKEN }}
           # cosign-base-identity: 'https://github.com/home-assistant/docker-base/.*'
           # cosign-base-verify: ghcr.io/home-assistant/base-python:3.14-alpine3.22
-          image: ghcr.io/${{ github.repository_owner }}/${{ matrix.arch }}-hassio-supervisor
+          image: ${{ matrix.image }}
           image-tags: |
             ${{ needs.init.outputs.version }}
             latest
@@ -270,7 +269,7 @@ jobs:
           image: ghcr.io/${{ github.repository_owner }}/amd64-hassio-supervisor
           image-tags: runner
           load: true
-          version: runner
+          version: ${{ needs.init.outputs.version }}
 
       # Pull the Supervisor for publish runs to test the published image
       - name: Pull Supervisor

@@ -518,6 +518,10 @@ class BackupManager(FileConfiguration, JobGroup):
         try:
             await self.sys_core.set_state(CoreState.FREEZE)
 
+            # Any exception leaving create() means the backup is incomplete
+            # and will be discarded (file unlinked below). Individual
+            # add-on/folder errors are captured inside store_addons/
+            # store_folders and do not propagate.
             async with backup.create():
                 # HomeAssistant Folder is for v1
                 if homeassistant:
@@ -681,7 +685,7 @@ class BackupManager(FileConfiguration, JobGroup):
             if addon and addon.is_installed:
                 addon_list.append(cast(Addon, addon))
                 continue
-            _LOGGER.warning("Add-on %s not found/installed", addon_slug)
+            _LOGGER.warning("App %s not found/installed", addon_slug)
 
         # If being run in the background, notify caller that validation has completed
         if validation_complete:
