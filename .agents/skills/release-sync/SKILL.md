@@ -29,11 +29,19 @@ git ls-remote --tags origin | grep "refs/tags/$version$"
 - 合并推送成功后通过`gh`命令发布版本
 - 遇到已存在的草稿发布版可删除
 - 生成详细的版本说明，内容可参考上游项目
-- 发布后发送详细的版本更新通知到公共频道`chat_id=$TELEGRAM_CHANNEL`
+- 发布后发送详细的版本说明通知到公共频道`chat_id=$TELEGRAM_CHANNEL`
 ```bash
-gh repo set-default owner/repo # 必须先设置默认仓库，避免使用upstream仓库
-gh release view $version
-gh release create $version --title "$version" --notes "<版本说明>"
+# 必须先设置默认仓库，避免使用upstream仓库
+gh repo set-default owner/repo
+
+# 确认当前版本是否已发布
+gh release view $version --repo owner/repo
+
+# 获取上游版本说明
+gh release view $version --repo home-assistant/supervisor
+
+# 发布版本
+gh release create $version --title "$version" --notes "<中文版本说明>"
 ```
 
 ## 冲突处理
@@ -44,5 +52,9 @@ gh release create $version --title "$version" --notes "<版本说明>"
 ```bash
 # 发送Telegram消息
 # text参数支持正常的Markdown语法，无需转义
-TELEGRAM_DEFAULT_CHAT=$chat_id npx -y mcporter call --stdio 'uvx mcp-notify' tg_send_message text="<MarkdownText>" parse_mode="MarkdownV2"
+npx -y mcporter call --stdio 'uvx mcp-notify' tg_send_message --args '{
+  "chat_id": "$chat_id",
+  "parse_mode": "MarkdownV2",
+  "text": "<MarkdownText>"
+}'
 ```
