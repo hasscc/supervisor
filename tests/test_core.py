@@ -10,10 +10,10 @@ import pytest
 
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
-from supervisor.exceptions import WhoamiSSLError
+from supervisor.exceptions import AppFileReadError, HassioError, WhoamiSSLError
 from supervisor.host.control import SystemControl
 from supervisor.host.info import InfoCenter
-from supervisor.resolution.const import IssueType, SuggestionType
+from supervisor.resolution.const import IssueType, SuggestionType, UnhealthyReason
 from supervisor.supervisor import Supervisor
 from supervisor.utils.whoami import WhoamiData
 
@@ -101,7 +101,9 @@ async def test_adjust_system_datetime_if_time_behind(
             InfoCenter, "dt_synchronized", new=PropertyMock(return_value=False)
         ),
         patch.object(InfoCenter, "use_ntp", new=PropertyMock(return_value=True)),
-        patch.object(Supervisor, "check_connectivity") as mock_check_connectivity,
+        patch.object(
+            Supervisor, "check_and_update_connectivity"
+        ) as mock_check_connectivity,
     ):
         # Start the time adjustment which will wait for timesyncd to stop
         task = asyncio.create_task(coresys.core._adjust_system_datetime())
@@ -156,3 +158,78 @@ async def test_write_state_failure(
 
     assert "Can't update the Supervisor state" in caplog.text
     assert coresys.core.state == CoreState.RUNNING
+
+
+# Components whose load() method is awaited from Core.setup().
+_SETUP_LOAD_COMPONENTS = (
+    "api",
+    "hardware",
+    "dbus",
+    "host",
+    "os",
+    "mounts",
+    "docker",
+    "updater",
+    "plugins",
+    "homeassistant",
+    "arch",
+    "store",
+    "apps",
+    "backups",
+    "services",
+    "discovery",
+    "ingress",
+    "resolution",
+)
+
+
+@pytest.fixture
+def mocked_setup_loads(coresys: CoreSys):
+    """Replace all load() calls in Core.setup() with AsyncMock."""
+    with (
+        patch.object(coresys, "init_websession", new=AsyncMock()),
+        patch.object(Supervisor, "check_and_update_connectivity", new=AsyncMock()),
+        patch.object(coresys.core, "_adjust_system_datetime", new=AsyncMock()),
+    ):
+        patches = [
+            patch.object(getattr(coresys, attr), "load", new=AsyncMock())
+            for attr in _SETUP_LOAD_COMPONENTS
+        ]
+        for p in patches:
+            p.start()
+        try:
+            yield
+        finally:
+            for p in patches:
+                p.stop()
+
+
+@pytest.mark.usefixtures("mocked_setup_loads")
+async def test_setup_app_file_read_error_not_captured(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test setup does not capture AppFileReadError to Sentry but marks unhealthy."""
+    coresys.apps.load.side_effect = AppFileReadError(
+        app="local_example", error="[Errno 74] Bad message"
+    )
+    with patch("supervisor.core.async_capture_exception") as capture_mock:
+        await coresys.core.setup()
+
+    capture_mock.assert_not_called()
+    assert "Fatal error happening on load Task" not in caplog.text
+    assert "Error on load Task" in caplog.text
+    assert UnhealthyReason.SETUP in coresys.resolution.unhealthy
+
+
+@pytest.mark.usefixtures("mocked_setup_loads")
+async def test_setup_unhandled_exception_captured(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test setup captures unhandled exceptions to Sentry and marks unhealthy."""
+    coresys.apps.load.side_effect = HassioError("boom")
+    with patch("supervisor.core.async_capture_exception") as capture_mock:
+        await coresys.core.setup()
+
+    capture_mock.assert_called_once()
+    assert "Fatal error happening on load Task" in caplog.text
+    assert UnhealthyReason.SETUP in coresys.resolution.unhealthy

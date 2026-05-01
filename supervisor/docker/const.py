@@ -23,6 +23,9 @@ DOCKER_HUB_API = "registry-1.docker.io"
 # Legacy Docker Hub identifier for backward compatibility
 DOCKER_HUB_LEGACY = "hub.docker.com"
 
+# GitHub Container Registry identifier
+GITHUB_CONTAINER_REGISTRY = "ghcr.io"
+
 
 class Capabilities(StrEnum):
     """Linux Capabilities."""
@@ -140,6 +143,7 @@ class Ulimit:
         }
 
 
+ENV_CORE_API_SOCKET = "SUPERVISOR_CORE_API_SOCKET"
 ENV_DUPLICATE_LOG_FILE = "HA_DUPLICATE_LOG_FILE"
 ENV_TIME = "TZ"
 ENV_TOKEN = "SUPERVISOR_TOKEN"
@@ -169,6 +173,12 @@ MOUNT_MACHINE_ID = DockerMount(
     target=MACHINE_ID.as_posix(),
     read_only=True,
 )
+MOUNT_CORE_RUN = DockerMount(
+    type=MountType.BIND,
+    source="/run/supervisor",
+    target="/run/supervisor",
+    read_only=False,
+)
 MOUNT_UDEV = DockerMount(
     type=MountType.BIND, source="/run/udev", target="/run/udev", read_only=True
 )
@@ -185,4 +195,6 @@ PATH_SHARE = PurePath("/share")
 PATH_MEDIA = PurePath("/media")
 
 # https://hub.docker.com/_/docker
-ADDON_BUILDER_IMAGE = "docker.io/library/docker"
+# Use short name as Docker stores it this way; the canonical docker.io/library/docker
+# does not match the reference filter used by cleanup_old_images.
+ADDON_BUILDER_IMAGE = "docker"

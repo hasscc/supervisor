@@ -14,6 +14,9 @@ SUPERVISOR_VERSION = "9999.09.9.dev9999"
 SERVER_SOFTWARE = f"HomeAssistantSupervisor/{SUPERVISOR_VERSION} aiohttp/{aiohttpversion} Python/{systemversion[0]}.{systemversion[1]}"
 
 DOCKER_PREFIX: str = "hassio"
+AUDIO_DOCKER_NAME: str = f"{DOCKER_PREFIX}_audio"
+CLI_DOCKER_NAME: str = f"{DOCKER_PREFIX}_cli"
+DNS_DOCKER_NAME: str = f"{DOCKER_PREFIX}_dns"
 OBSERVER_DOCKER_NAME: str = f"{DOCKER_PREFIX}_observer"
 SUPERVISOR_DOCKER_NAME: str = f"{DOCKER_PREFIX}_supervisor"
 
@@ -39,9 +42,10 @@ FILE_HASSIO_SECURITY = Path(SUPERVISOR_DATA, "security.json")
 FILE_SUFFIX_CONFIGURATION = [".yaml", ".yml", ".json"]
 
 MACHINE_ID = Path("/etc/machine-id")
+RUN_SUPERVISOR_STATE = Path("/run/supervisor")
+SOCKET_CORE = Path("/run/os/core.sock")
 SOCKET_DBUS = Path("/run/dbus/system_bus_socket")
 SOCKET_DOCKER = Path("/run/docker.sock")
-RUN_SUPERVISOR_STATE = Path("/run/supervisor")
 SYSTEMD_JOURNAL_PERSISTENT = Path("/var/log/journal")
 SYSTEMD_JOURNAL_VOLATILE = Path("/run/log/journal")
 
@@ -106,10 +110,11 @@ ATTR_ACCESS_TOKEN = "access_token"
 ATTR_ACCESSPOINTS = "accesspoints"
 ATTR_ACTIVE = "active"
 ATTR_ACTIVITY_LED = "activity_led"
-ATTR_ADDON = "addon"
 ATTR_ADDONS = "addons"
-ATTR_ADDONS_CUSTOM_LIST = "addons_custom_list"
-ATTR_ADDONS_REPOSITORIES = "addons_repositories"
+ATTR_APP = "addon"
+ATTR_APPS = "apps"
+ATTR_APPS_CUSTOM_LIST = "addons_custom_list"
+ATTR_APPS_REPOSITORIES = "addons_repositories"
 ATTR_ADDR_GEN_MODE = "addr_gen_mode"
 ATTR_ADDRESS = "address"
 ATTR_ADDRESS_DATA = "address-data"
@@ -192,6 +197,7 @@ ATTR_ENVIRONMENT = "environment"
 ATTR_EVENT = "event"
 ATTR_EXCLUDE_DATABASE = "exclude_database"
 ATTR_EXTRA = "extra"
+ATTR_FEATURE_FLAGS = "feature_flags"
 ATTR_FEATURES = "features"
 ATTR_FIELDS = "fields"
 ATTR_FILENAME = "filename"
@@ -433,16 +439,16 @@ OBSERVER_PORT = 4357
 DEFAULT_CHUNK_SIZE = 2**16  # 64KiB
 
 
-class AddonBootConfig(StrEnum):
-    """Boot mode config for the add-on."""
+class AppBootConfig(StrEnum):
+    """Boot mode config for the app."""
 
     AUTO = "auto"
     MANUAL = "manual"
     MANUAL_ONLY = "manual_only"
 
 
-class AddonBoot(StrEnum):
-    """Boot mode for the add-on."""
+class AppBoot(StrEnum):
+    """Boot mode for the app."""
 
     AUTO = "auto"
     MANUAL = "manual"
@@ -450,15 +456,15 @@ class AddonBoot(StrEnum):
     @classmethod
     def _missing_(cls, value: object) -> Self | None:
         """Convert 'forced' config values to their counterpart."""
-        if value == AddonBootConfig.MANUAL_ONLY:
+        if value == AppBootConfig.MANUAL_ONLY:
             for member in cls:
-                if member == AddonBoot.MANUAL:
+                if member == AppBoot.MANUAL:
                     return member
         return None
 
 
-class AddonStartup(StrEnum):
-    """Startup types of Add-on."""
+class AppStartup(StrEnum):
+    """Startup types of App."""
 
     INITIALIZE = "initialize"
     SYSTEM = "system"
@@ -467,16 +473,16 @@ class AddonStartup(StrEnum):
     ONCE = "once"
 
 
-class AddonStage(StrEnum):
-    """Stage types of add-on."""
+class AppStage(StrEnum):
+    """Stage types of app."""
 
     STABLE = "stable"
     EXPERIMENTAL = "experimental"
     DEPRECATED = "deprecated"
 
 
-class AddonState(StrEnum):
-    """State of add-on."""
+class AppState(StrEnum):
+    """State of app."""
 
     STARTUP = "startup"
     STARTED = "started"
@@ -546,6 +552,13 @@ class CpuArch(StrEnum):
 
     AARCH64 = "aarch64"
     AMD64 = "amd64"
+
+
+class FeatureFlag(StrEnum):
+    """Development features that can be toggled."""
+
+    SUPERVISOR_V2_API = "supervisor_v2_api"
+    UNIX_SOCKET_CORE_API = "unix_socket_core_api"
 
 
 @dataclass

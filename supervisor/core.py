@@ -11,13 +11,14 @@ from .const import (
     ATTR_STARTUP,
     RUN_SUPERVISOR_STATE,
     STARTING_STATES,
-    AddonStartup,
+    AppStartup,
     BusEvent,
     CoreState,
 )
 from .coresys import CoreSys, CoreSysAttributes
 from .dbus.const import StopUnitMode, UnitActiveState
 from .exceptions import (
+    AppFileReadError,
     HassioError,
     HomeAssistantCrashError,
     HomeAssistantError,
@@ -139,7 +140,7 @@ class Core(CoreSysAttributes):
         await self.coresys.init_websession()
 
         # Check internet on startup
-        await self.sys_supervisor.check_connectivity()
+        await self.sys_supervisor.check_and_update_connectivity(force=True)
 
         # Order can be important!
         setup_loads: list[Awaitable[None]] = [
@@ -169,8 +170,8 @@ class Core(CoreSysAttributes):
             self.sys_arch.load(),
             # Load Stores
             self.sys_store.load(),
-            # Load Add-ons
-            self.sys_addons.load(),
+            # Load Apps
+            self.sys_apps.load(),
             # load last available data
             self.sys_backups.load(),
             # load services
@@ -187,6 +188,16 @@ class Core(CoreSysAttributes):
         for setup_task in setup_loads:
             try:
                 await setup_task
+            except AppFileReadError as err:
+                # Already reported to the user via the resolution system
+                # (unhealthy reason set by check_oserror). Log without
+                # stack trace and skip Sentry capture to avoid noise.
+                _LOGGER.error(
+                    "Error on load Task %s: %s",
+                    setup_task,
+                    err,
+                )
+                self.sys_resolution.add_unhealthy_reason(UnhealthyReason.SETUP)
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.critical(
                     "Fatal error happening on load Task %s: %s",
@@ -235,8 +246,8 @@ class Core(CoreSysAttributes):
                     return
 
         try:
-            # Start addon mark as initialize
-            await self.sys_addons.boot(AddonStartup.INITIALIZE)
+            # Start app mark as initialize
+            await self.sys_apps.boot(AppStartup.INITIALIZE)
 
             # HomeAssistant is already running, only Supervisor restarted
             if await self.sys_hardware.helper.last_boot() == self.sys_config.last_boot:
@@ -246,11 +257,11 @@ class Core(CoreSysAttributes):
             # reset register services / discovery
             await self.sys_services.reset()
 
-            # start addon mark as system
-            await self.sys_addons.boot(AddonStartup.SYSTEM)
+            # start app mark as system
+            await self.sys_apps.boot(AppStartup.SYSTEM)
 
-            # start addon mark as services
-            await self.sys_addons.boot(AddonStartup.SERVICES)
+            # start app mark as services
+            await self.sys_apps.boot(AppStartup.SERVICES)
 
             # run HomeAssistant
             if (
@@ -279,8 +290,8 @@ class Core(CoreSysAttributes):
                     suggestions=[SuggestionType.EXECUTE_REPAIR],
                 )
 
-            # start addon mark as application
-            await self.sys_addons.boot(AddonStartup.APPLICATION)
+            # start app mark as application
+            await self.sys_apps.boot(AppStartup.APPLICATION)
 
             # store new last boot
             await self._update_last_boot()
@@ -338,6 +349,7 @@ class Core(CoreSysAttributes):
                         self.sys_create_task(coro)
                         for coro in (
                             self.sys_websession.close(),
+                            self.sys_homeassistant.api.close(),
                             self.sys_ingress.unload(),
                             self.sys_hardware.unload(),
                             self.sys_dbus.unload(),
@@ -357,8 +369,8 @@ class Core(CoreSysAttributes):
         if self.state == CoreState.RUNNING:
             await self.set_state(CoreState.SHUTDOWN)
 
-        # Shutdown Application Add-ons, using Home Assistant API
-        await self.sys_addons.shutdown(AddonStartup.APPLICATION)
+        # Shutdown Application Apps, using Home Assistant API
+        await self.sys_apps.shutdown(AppStartup.APPLICATION)
 
         # Close Home Assistant
         with suppress(HassioError):
@@ -366,10 +378,10 @@ class Core(CoreSysAttributes):
                 remove_container=remove_homeassistant_container
             )
 
-        # Shutdown System Add-ons
-        await self.sys_addons.shutdown(AddonStartup.SERVICES)
-        await self.sys_addons.shutdown(AddonStartup.SYSTEM)
-        await self.sys_addons.shutdown(AddonStartup.INITIALIZE)
+        # Shutdown System Apps
+        await self.sys_apps.shutdown(AppStartup.SERVICES)
+        await self.sys_apps.shutdown(AppStartup.SYSTEM)
+        await self.sys_apps.shutdown(AppStartup.INITIALIZE)
 
         # Shutdown all Plugins
         if self.state in (CoreState.STOPPING, CoreState.SHUTDOWN):
@@ -459,7 +471,10 @@ class Core(CoreSysAttributes):
             )
 
         await self.sys_host.control.set_datetime(data.dt_utc)
-        await self.sys_supervisor.check_connectivity()
+        # System time was just corrected. TLS certificates that previously
+        # appeared expired/not-yet-valid may now verify, so a connectivity
+        # probe that just failed for that reason can succeed now.
+        await self.sys_supervisor.check_and_update_connectivity(force=True)
 
     async def repair(self) -> None:
         """Repair system integrity."""
@@ -470,7 +485,7 @@ class Core(CoreSysAttributes):
         await self.sys_plugins.repair()
 
         # Restore core functionality
-        await self.sys_addons.repair()
+        await self.sys_apps.repair()
         await self.sys_homeassistant.core.repair()
 
         # Tag version for latest

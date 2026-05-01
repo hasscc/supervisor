@@ -26,7 +26,7 @@ import pytest
 from securetar import SecureTarArchive
 
 from supervisor import config as su_config
-from supervisor.addons.addon import Addon
+from supervisor.addons.addon import App
 from supervisor.addons.validate import SCHEMA_ADDON_SYSTEM
 from supervisor.api import RestAPI
 from supervisor.backups.backup import Backup
@@ -35,7 +35,7 @@ from supervisor.backups.validate import ALL_FOLDERS
 from supervisor.bootstrap import initialize_coresys
 from supervisor.const import (
     ATTR_ADDONS,
-    ATTR_ADDONS_CUSTOM_LIST,
+    ATTR_APPS_CUSTOM_LIST,
     ATTR_DATE,
     ATTR_EXCLUDE_DATABASE,
     ATTR_FOLDERS,
@@ -57,7 +57,7 @@ from supervisor.exceptions import HostLogError
 from supervisor.homeassistant.api import APIState
 from supervisor.host.logs import LogsControl
 from supervisor.os.manager import OSManager
-from supervisor.store.addon import AddonStore
+from supervisor.store.addon import AppStore
 from supervisor.store.repository import Repository
 from supervisor.utils.dt import utcnow
 
@@ -517,7 +517,7 @@ async def coresys(
     coresys_obj._config.save_data = AsyncMock()
     coresys_obj._jobs.save_data = AsyncMock()
     coresys_obj._resolution.save_data = AsyncMock()
-    coresys_obj._addons.data.save_data = AsyncMock()
+    coresys_obj._apps.data.save_data = AsyncMock()
     coresys_obj._store.save_data = AsyncMock()
     coresys_obj._mounts.save_data = AsyncMock()
 
@@ -563,18 +563,18 @@ async def coresys(
         Path(__file__).parent.joinpath("fixtures"), "apparmor"
     )
 
-    # WebSocket
+    # Home Assistant Core API
     coresys_obj.homeassistant.api.get_api_state = AsyncMock(
         return_value=APIState("RUNNING", False)
     )
-    coresys_obj.homeassistant._websocket._client = AsyncMock(
+    coresys_obj.homeassistant._websocket.client = AsyncMock(
         ha_version=AwesomeVersion("2021.2.4")
     )
 
     if not request.node.get_closest_marker("no_mock_init_websession"):
         coresys_obj.init_websession = AsyncMock()
 
-    # Don't remove files/folders related to addons and stores
+    # Don't remove files/folders related to apps and stores
     with patch("supervisor.store.git.GitRepo.remove"):
         yield coresys_obj
 
@@ -587,7 +587,7 @@ async def ha_ws_client(coresys: CoreSys) -> AsyncMock:
     # Set Supervisor Core state to RUNNING, otherwise WS events won't be delivered
     await coresys.core.set_state(CoreState.RUNNING)
     await asyncio.sleep(0)
-    client = coresys.homeassistant.websocket._client
+    client = coresys.homeassistant.websocket.client
     client.async_send_command.reset_mock()
     return client
 
@@ -608,8 +608,8 @@ async def tmp_supervisor_data(coresys: CoreSys, tmp_path: Path) -> Path:
         coresys.config.path_audio.mkdir()
         coresys.config.path_dns.mkdir()
         coresys.config.path_share.mkdir()
-        coresys.config.path_addons_data.mkdir(parents=True)
-        coresys.config.path_addon_configs.mkdir(parents=True)
+        coresys.config.path_apps_data.mkdir(parents=True)
+        coresys.config.path_app_configs.mkdir(parents=True)
         coresys.config.path_ssl.mkdir()
         coresys.config.path_core_backup.mkdir(parents=True)
         coresys.config.path_cid_files.mkdir()
@@ -689,9 +689,9 @@ async def api_client(
 
     @web.middleware
     async def _security_middleware(request: web.Request, handler: web.RequestHandler):
-        """Make request are from Core or specified add-on."""
+        """Make request are from Core or specified app."""
         if request_from:
-            request[REQUEST_FROM] = coresys.addons.get(request_from, local_only=True)
+            request[REQUEST_FROM] = coresys.apps.get(request_from, local_only=True)
         else:
             request[REQUEST_FROM] = coresys.homeassistant
 
@@ -708,14 +708,19 @@ async def api_client(
 def supervisor_internet(coresys: CoreSys) -> Generator[AsyncMock]:
     """Fixture which simluate Supervsior internet connection."""
     connectivity_check = AsyncMock(return_value=True)
-    coresys.supervisor.check_connectivity = connectivity_check
+    coresys.supervisor.check_and_update_connectivity = connectivity_check
     yield connectivity_check
 
 
 @pytest.fixture
 def websession(coresys: CoreSys) -> Generator[MagicMock]:
-    """Fixture for global aiohttp SessionClient."""
+    """Fixture for global aiohttp SessionClient.
+
+    Also mocks Core container is_running to return True so that
+    make_request doesn't bail before reaching the websession.
+    """
     coresys._websession = MagicMock(spec_set=ClientSession)
+    coresys.homeassistant.core.instance.is_running = AsyncMock(return_value=True)
     yield coresys._websession
 
 
@@ -749,22 +754,22 @@ def run_supervisor_state(request: pytest.FixtureRequest) -> Generator[MagicMock]
 
 
 @pytest.fixture
-def store_addon(coresys: CoreSys, tmp_path, test_repository):
-    """Store add-on fixture."""
-    addon_obj = AddonStore(coresys, "test_store_addon")
+def store_app(coresys: CoreSys, tmp_path, test_repository):
+    """Store app fixture."""
+    app_obj = AppStore(coresys, "test_store_addon")
 
-    coresys.addons.store[addon_obj.slug] = addon_obj
-    coresys.store.data.addons[addon_obj.slug] = SCHEMA_ADDON_SYSTEM(
+    coresys.apps.store[app_obj.slug] = app_obj
+    coresys.store.data.apps[app_obj.slug] = SCHEMA_ADDON_SYSTEM(
         load_json_fixture("add-on.json")
     )
-    coresys.store.data.addons[addon_obj.slug]["location"] = tmp_path
-    yield addon_obj
+    coresys.store.data.apps[app_obj.slug]["location"] = tmp_path
+    yield app_obj
 
 
 @pytest.fixture
 async def test_repository(coresys: CoreSys):
-    """Test add-on store repository fixture."""
-    coresys.config._data[ATTR_ADDONS_CUSTOM_LIST] = []
+    """Test app store repository fixture."""
+    coresys.config._data[ATTR_APPS_CUSTOM_LIST] = []
 
     with (
         patch("supervisor.store.git.GitRepo.load", return_value=None),
@@ -784,27 +789,27 @@ async def test_repository(coresys: CoreSys):
 
 
 @pytest.fixture
-async def install_addon_ssh(coresys: CoreSys, test_repository):
-    """Install local_ssh add-on."""
-    store = coresys.addons.store[TEST_ADDON_SLUG]
-    await coresys.addons.data.install(store)
-    coresys.addons.data._data = coresys.addons.data._schema(coresys.addons.data._data)
+async def install_app_ssh(coresys: CoreSys, test_repository):
+    """Install local_ssh app."""
+    store = coresys.apps.store[TEST_ADDON_SLUG]
+    await coresys.apps.data.install(store)
+    coresys.apps.data._data = coresys.apps.data._schema(coresys.apps.data._data)
 
-    addon = Addon(coresys, store.slug)
-    coresys.addons.local[addon.slug] = addon
-    yield addon
+    app = App(coresys, store.slug)
+    coresys.apps.local[app.slug] = app
+    yield app
 
 
 @pytest.fixture
-async def install_addon_example(coresys: CoreSys, test_repository):
-    """Install local_example add-on."""
-    store = coresys.addons.store["local_example"]
-    await coresys.addons.data.install(store)
-    coresys.addons.data._data = coresys.addons.data._schema(coresys.addons.data._data)
+async def install_app_example(coresys: CoreSys, test_repository):
+    """Install local_example app."""
+    store = coresys.apps.store["local_example"]
+    await coresys.apps.data.install(store)
+    coresys.apps.data._data = coresys.apps.data._schema(coresys.apps.data._data)
 
-    addon = Addon(coresys, store.slug)
-    coresys.addons.local[addon.slug] = addon
-    yield addon
+    app = App(coresys, store.slug)
+    coresys.apps.local[app.slug] = app
+    yield app
 
 
 @pytest.fixture

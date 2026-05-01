@@ -12,14 +12,15 @@ from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.addons.addon import Addon
+from supervisor.addons.addon import App
 from supervisor.backups.backup import Backup, BackupLocation
+from supervisor.backups.manager import BackupManager
 from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.docker.manager import DockerAPI
 from supervisor.exceptions import (
-    AddonPrePostBackupCommandReturnedError,
-    AddonsError,
+    AppPrePostBackupCommandReturnedError,
+    AppsError,
     BackupInvalidError,
     HomeAssistantBackupError,
 )
@@ -90,13 +91,16 @@ async def test_list(api_client: TestClient, coresys: CoreSys, tmp_path: Path):
     assert result["data"]["backups"][0]["size_bytes"] == 10240
 
 
-async def test_options(api_client: TestClient, coresys: CoreSys):
+async def test_options(
+    api_client_with_prefix: tuple[TestClient, str], coresys: CoreSys
+):
     """Test options endpoint."""
+    client, prefix = api_client_with_prefix
     assert coresys.backups.days_until_stale == 30
 
     with patch.object(type(coresys.backups), "save_data") as save_data:
-        await api_client.post(
-            "/backups/options",
+        await client.post(
+            f"{prefix}/backups/options",
             json={
                 "days_until_stale": 10,
             },
@@ -194,16 +198,57 @@ async def test_backup_to_default(api_client: TestClient, coresys: CoreSys):
     assert (mount_dir / f"{slug}.tar").exists()
 
 
+@pytest.mark.usefixtures(
+    "tmp_supervisor_data", "path_extern", "mount_propagation", "mock_is_mount"
+)
+async def test_backup_to_down_mount_returns_400(
+    api_client: TestClient, coresys: CoreSys, mock_is_mount: MagicMock
+):
+    """Backup to a down mount returns a structured 400 instead of an unexpected 400."""
+    await coresys.mounts.load()
+    (coresys.config.path_mounts / "backup_test").mkdir()
+    mount = Mount.from_dict(
+        coresys,
+        {
+            "name": "backup_test",
+            "type": "cifs",
+            "usage": "backup",
+            "server": "backup.local",
+            "share": "backups",
+        },
+    )
+    await coresys.mounts.create_mount(mount)
+    coresys.mounts.default_backup_mount = mount
+
+    mock_is_mount.return_value = False
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    resp = await api_client.post(
+        "/backups/new/full",
+        json={"name": "Mount test", "location": "backup_test"},
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert body["result"] == "error"
+    assert body["message"] == "Backup mount 'backup_test' is down"
+    assert body["error_key"] == "backup_mount_down"
+    assert body["extra_fields"] == {"mount": "backup_test"}
+
+
 @pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
 async def test_api_freeze_thaw(
-    api_client: TestClient, coresys: CoreSys, ha_ws_client: AsyncMock
+    api_client_with_prefix: tuple[TestClient, str],
+    coresys: CoreSys,
+    ha_ws_client: AsyncMock,
 ):
     """Test manual freeze and thaw for external backup via API."""
+    client, prefix = api_client_with_prefix
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
     ha_ws_client.ha_version = AwesomeVersion("2022.1.0")
 
-    await api_client.post("/backups/freeze")
+    await client.post(f"{prefix}/backups/freeze")
     assert coresys.core.state == CoreState.FREEZE
     await asyncio.sleep(0)
     assert any(
@@ -212,7 +257,7 @@ async def test_api_freeze_thaw(
     )
 
     ha_ws_client.async_send_command.reset_mock()
-    await api_client.post("/backups/thaw")
+    await client.post(f"{prefix}/backups/thaw")
     assert coresys.core.state == CoreState.RUNNING
     await asyncio.sleep(0)
     assert any(
@@ -359,7 +404,7 @@ async def test_api_backup_restore_background(
         ),
     ],
 )
-@pytest.mark.usefixtures("install_addon_ssh", "path_extern")
+@pytest.mark.usefixtures("install_app_ssh", "path_extern")
 async def test_api_backup_errors(
     api_client: TestClient,
     coresys: CoreSys,
@@ -375,9 +420,7 @@ async def test_api_backup_errors(
 
     assert coresys.jobs.jobs == []
 
-    with patch.object(
-        Addon, "backup", side_effect=(err := AddonsError("Backup error"))
-    ):
+    with patch.object(App, "backup", side_effect=(err := AppsError("Backup error"))):
         resp = await api_client.post(
             f"/backups/new/{backup_type}",
             json={"name": f"{backup_type} backup"} | options,
@@ -423,7 +466,7 @@ async def test_api_backup_errors(
             "backup",
             side_effect=HomeAssistantBackupError("Backup error"),
         ),
-        patch.object(Addon, "backup"),
+        patch.object(App, "backup"),
     ):
         resp = await api_client.post(
             f"/backups/new/{backup_type}",
@@ -461,22 +504,27 @@ async def test_api_backup_errors(
 
 async def test_backup_immediate_errors(api_client: TestClient, coresys: CoreSys):
     """Test backup errors that return immediately even in background mode."""
-    await coresys.core.set_state(CoreState.FREEZE)
-    resp = await api_client.post(
-        "/backups/new/full",
-        json={"name": "Test", "background": True},
-    )
-    assert resp.status == 400
-    assert "freeze" in (await resp.json())["message"]
+    with patch("supervisor.api.utils.async_capture_exception") as capture_exception:
+        await coresys.core.set_state(CoreState.FREEZE)
+        resp = await api_client.post(
+            "/backups/new/full",
+            json={"name": "Test", "background": True},
+        )
+        assert resp.status == 400
+        assert "freeze" in (await resp.json())["message"]
 
-    await coresys.core.set_state(CoreState.RUNNING)
-    coresys.hardware.disk.get_disk_free_space = lambda x: 0.5
-    resp = await api_client.post(
-        "/backups/new/partial",
-        json={"name": "Test", "homeassistant": True, "background": True},
-    )
-    assert resp.status == 400
-    assert "not enough free space" in (await resp.json())["message"]
+        await coresys.core.set_state(CoreState.RUNNING)
+        coresys.hardware.disk.get_disk_free_space = lambda x: 0.5
+        resp = await api_client.post(
+            "/backups/new/partial",
+            json={"name": "Test", "homeassistant": True, "background": True},
+        )
+        assert resp.status == 400
+        assert "not enough free space" in (await resp.json())["message"]
+
+        # Job condition failures are user/environment driven; api_process
+        # must not capture them to Sentry.
+        capture_exception.assert_not_called()
 
 
 async def test_restore_immediate_errors(
@@ -558,20 +606,20 @@ async def test_restore_immediate_errors(
     ("folder", "location"), [("backup", None), ("core/backup", ".cloud_backup")]
 )
 async def test_reload(
-    request: pytest.FixtureRequest,
-    api_client: TestClient,
+    api_client_with_prefix: tuple[TestClient, str],
     coresys: CoreSys,
     tmp_supervisor_data: Path,
     folder: str,
     location: str | None,
 ):
     """Test backups reload."""
+    client, prefix = api_client_with_prefix
     assert not coresys.backups.list_backups
 
     backup_file = get_fixture_path("backup_example.tar")
     copy(backup_file, tmp_supervisor_data / folder)
 
-    resp = await api_client.post("/backups/reload")
+    resp = await client.post(f"{prefix}/backups/reload")
     assert resp.status == 200
 
     assert len(coresys.backups.list_backups) == 1
@@ -580,7 +628,7 @@ async def test_reload(
     assert backup.locations == [location]
 
 
-@pytest.mark.usefixtures("install_addon_ssh")
+@pytest.mark.usefixtures("install_app_ssh")
 @pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
 async def test_cloud_backup_core_only(api_client: TestClient, mock_full_backup: Backup):
     """Test only core can access cloud backup location."""
@@ -908,17 +956,23 @@ async def test_upload_with_filename(
         ("get", "/backups/bad/download"),
     ],
 )
-async def test_backup_not_found(api_client: TestClient, method: str, url: str):
+async def test_backup_not_found(
+    api_client_with_prefix: tuple[TestClient, str], method: str, url: str
+):
     """Test backup not found error."""
-    resp = await api_client.request(method, url)
+    client, prefix = api_client_with_prefix
+    resp = await client.request(method, f"{prefix}{url}")
     assert resp.status == 404
     resp = await resp.json()
     assert resp["message"] == "Backup does not exist"
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_remove_backup_from_location(api_client: TestClient, coresys: CoreSys):
+async def test_remove_backup_from_location(
+    api_client_with_prefix: tuple[TestClient, str], coresys: CoreSys
+):
     """Test removing a backup from one location of multiple."""
+    client, prefix = api_client_with_prefix
     backup_file = get_fixture_path("backup_example.tar")
     location_1 = Path(copy(backup_file, coresys.config.path_backup))
     location_2 = Path(copy(backup_file, coresys.config.path_core_backup))
@@ -932,8 +986,8 @@ async def test_remove_backup_from_location(api_client: TestClient, coresys: Core
         ),
     }
 
-    resp = await api_client.delete(
-        "/backups/7fed74c8", json={"location": ".cloud_backup"}
+    resp = await client.delete(
+        f"{prefix}/backups/7fed74c8", json={"location": ".cloud_backup"}
     )
     assert resp.status == 200
 
@@ -946,8 +1000,11 @@ async def test_remove_backup_from_location(api_client: TestClient, coresys: Core
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_remove_backup_file_not_found(api_client: TestClient, coresys: CoreSys):
+async def test_remove_backup_file_not_found(
+    api_client_with_prefix: tuple[TestClient, str], coresys: CoreSys
+):
     """Test removing a backup from one location of multiple."""
+    client, prefix = api_client_with_prefix
     backup_file = get_fixture_path("backup_example.tar")
     location = Path(copy(backup_file, coresys.config.path_backup))
 
@@ -958,7 +1015,7 @@ async def test_remove_backup_file_not_found(api_client: TestClient, coresys: Cor
     }
 
     location.unlink()
-    resp = await api_client.delete("/backups/7fed74c8")
+    resp = await client.delete(f"{prefix}/backups/7fed74c8")
     assert resp.status == 404
     body = await resp.json()
     assert (
@@ -1008,30 +1065,33 @@ async def test_download_backup_from_location(
 
 
 @pytest.mark.usefixtures("mock_full_backup")
-async def test_download_backup_from_invalid_location(api_client: TestClient):
+async def test_download_backup_from_invalid_location(
+    api_client_with_prefix: tuple[TestClient, str],
+):
     """Test error for invalid download location."""
-    resp = await api_client.get("/backups/test/download?location=.cloud_backup")
+    client, prefix = api_client_with_prefix
+    resp = await client.get(f"{prefix}/backups/test/download?location=.cloud_backup")
     assert resp.status == 400
     body = await resp.json()
     assert body["message"] == "Backup test is not in location .cloud_backup"
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data")
-async def test_partial_backup_all_addons(
+async def test_partial_backup_all_apps(
     api_client: TestClient,
     coresys: CoreSys,
-    install_addon_ssh: Addon,
+    install_app_ssh: App,
 ):
     """Test backup including extra metdata."""
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
 
-    with patch.object(Backup, "store_addons") as store_addons:
+    with patch.object(Backup, "store_apps") as store_apps:
         resp = await api_client.post(
             "/backups/new/partial", json={"name": "All addons test", "addons": "ALL"}
         )
         assert resp.status == 200
-        store_addons.assert_called_once_with([install_addon_ssh])
+        store_apps.assert_called_once_with([install_app_ssh])
 
 
 @pytest.mark.parametrize("local_location", [None, "", ".local"])
@@ -1497,7 +1557,7 @@ async def test_immediate_list_after_missing_file_restore(
 
 
 @pytest.mark.parametrize("command", ["backup_pre", "backup_post"])
-@pytest.mark.usefixtures("install_addon_example", "tmp_supervisor_data")
+@pytest.mark.usefixtures("install_app_example", "tmp_supervisor_data")
 async def test_pre_post_backup_command_error(
     api_client: TestClient, coresys: CoreSys, container: DockerContainer, command: str
 ):
@@ -1509,7 +1569,7 @@ async def test_pre_post_backup_command_error(
     container.show.return_value["State"]["Running"] = True
     container.exec.return_value.inspect.return_value = {"ExitCode": 1}
 
-    with patch.object(Addon, command, new=PropertyMock(return_value="test")):
+    with patch.object(App, command, new=PropertyMock(return_value="test")):
         resp = await api_client.post(
             "/backups/new/partial", json={"addons": ["local_example"]}
         )
@@ -1525,7 +1585,7 @@ async def test_pre_post_backup_command_error(
 
     assert job
     assert job.done is True
-    assert job.errors[0].type_ == AddonPrePostBackupCommandReturnedError
+    assert job.errors[0].type_ == AppPrePostBackupCommandReturnedError
     assert job.errors[0].message == (
         "Pre-/Post backup command for app local_example returned error code: "
         "1. Please report this to the app developer. Enable debug "
@@ -1537,3 +1597,159 @@ async def test_pre_post_backup_command_error(
         "exit_code": 1,
         "debug_logging_command": "ha supervisor options --logging debug",
     }
+
+
+async def test_restore_partial_with_addons_key(
+    api_client: TestClient,
+    coresys: CoreSys,
+    mock_partial_backup: Backup,
+):
+    """Test that partial restore accepts 'addons' key in request body and remaps it to 'apps'."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with patch.object(
+        BackupManager, "do_restore_partial", return_value=True
+    ) as mock_restore:
+        resp = await api_client.post(
+            f"/backups/{mock_partial_backup.slug}/restore/partial",
+            json={"addons": ["local_ssh"]},
+        )
+
+    assert resp.status == 200
+    mock_restore.assert_called_once()
+    _, call_kwargs = mock_restore.call_args
+    assert "apps" in call_kwargs
+    assert call_kwargs["apps"] == ["local_ssh"]
+    assert "addons" not in call_kwargs
+
+
+# ── V2 API tests ──────────────────────────────────────────────────────────────
+
+
+async def test_v2_api_disabled_without_feature_flag(api_client: TestClient):
+    """V2 API routes return 404 when SUPERVISOR_V2_API feature flag is not enabled."""
+    resp = await api_client.get("/v2/backups")
+    assert resp.status == 404
+    resp = await api_client.get("/v2/backups/info")
+    assert resp.status == 404
+    resp = await api_client.get("/v2/apps")
+    assert resp.status == 404
+    resp = await api_client.get("/v2/store")
+    assert resp.status == 404
+
+
+@pytest.mark.usefixtures("mock_full_backup")
+async def test_v2_info_uses_apps_key(
+    api_client_v2: TestClient, coresys: CoreSys, tmp_path: Path
+):
+    """V2 /backups/info returns content with 'apps' key (not 'addons')."""
+    copy(get_fixture_path("backup_example.tar"), tmp_path / "test_backup.tar")
+
+    resp = await api_client_v2.get("/v2/backups/info")
+    result = await resp.json()
+    assert result["result"] == "ok"
+    assert len(result["data"]["backups"]) == 1
+    content = result["data"]["backups"][0]["content"]
+    assert "apps" in content
+    assert "addons" not in content
+    assert content["apps"] == ["local_ssh"]
+
+
+@pytest.mark.usefixtures("mock_full_backup")
+async def test_v2_list_uses_apps_key(
+    api_client_v2: TestClient, coresys: CoreSys, tmp_path: Path
+):
+    """V2 /backups returns content with 'apps' key (not 'addons')."""
+    copy(get_fixture_path("backup_example.tar"), tmp_path / "test_backup.tar")
+
+    resp = await api_client_v2.get("/v2/backups")
+    result = await resp.json()
+    assert result["result"] == "ok"
+    content = result["data"]["backups"][0]["content"]
+    assert "apps" in content
+    assert "addons" not in content
+    assert content["apps"] == ["local_ssh"]
+
+
+@pytest.mark.usefixtures("mock_full_backup")
+async def test_v2_backup_info_uses_apps_key(
+    api_client_v2: TestClient, coresys: CoreSys, tmp_path: Path
+):
+    """V2 /backups/{slug}/info returns 'apps' key at top level (not 'addons')."""
+    copy(get_fixture_path("backup_example.tar"), tmp_path / "test_backup.tar")
+
+    resp = await api_client_v2.get("/v2/backups/test/info")
+    result = await resp.json()
+    assert result["result"] == "ok"
+    assert "apps" in result["data"]
+    assert "addons" not in result["data"]
+    assert result["data"]["apps"][0]["slug"] == "local_ssh"
+
+
+async def test_v2_backup_partial_accepts_apps_key(
+    api_client_v2: TestClient,
+    coresys: CoreSys,
+    mock_partial_backup: Backup,
+):
+    """V2 /backups/new/partial accepts 'apps' key in request body."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with patch.object(
+        BackupManager, "do_backup_partial", return_value=mock_partial_backup
+    ) as mock_backup:
+        resp = await api_client_v2.post(
+            "/v2/backups/new/partial",
+            json={"apps": ["local_ssh"]},
+        )
+
+    assert resp.status == 200
+    mock_backup.assert_called_once()
+    _, call_kwargs = mock_backup.call_args
+    assert "apps" in call_kwargs
+    assert call_kwargs["apps"] == ["local_ssh"]
+
+
+async def test_v2_backup_partial_rejects_addons_key(
+    api_client_v2: TestClient,
+    coresys: CoreSys,
+):
+    """V2 /backups/new/partial does not accept 'addons' key (v2 is strict)."""
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    resp = await api_client_v2.post(
+        "/v2/backups/new/partial",
+        json={"addons": ["local_ssh"]},
+    )
+
+    # "addons" key is rejected in v2
+    assert resp.status == 400
+    result = await resp.json()
+    assert result["result"] == "error"
+    assert "addons" in result["message"]
+
+
+async def test_v2_restore_partial_accepts_apps_key(
+    api_client_v2: TestClient,
+    coresys: CoreSys,
+    mock_partial_backup: Backup,
+):
+    """V2 restore/partial accepts 'apps' key and passes it through without remapping."""
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with patch.object(
+        BackupManager, "do_restore_partial", return_value=True
+    ) as mock_restore:
+        resp = await api_client_v2.post(
+            f"/v2/backups/{mock_partial_backup.slug}/restore/partial",
+            json={"apps": ["local_ssh"]},
+        )
+
+    assert resp.status == 200
+    mock_restore.assert_called_once()
+    _, call_kwargs = mock_restore.call_args
+    assert "apps" in call_kwargs
+    assert call_kwargs["apps"] == ["local_ssh"]
+    assert "addons" not in call_kwargs

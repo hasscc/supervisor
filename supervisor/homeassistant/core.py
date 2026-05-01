@@ -321,8 +321,6 @@ class HomeAssistantCore(JobGroup):
 
             # Successfull - last step
             await self.sys_homeassistant.save_data()
-            with suppress(DockerError):
-                await self.instance.cleanup(old_image=old_image)
 
         # Update Home Assistant
         with suppress(HomeAssistantError):
@@ -332,22 +330,24 @@ class HomeAssistantCore(JobGroup):
             try:
                 data = await self.sys_homeassistant.api.get_config()
             except HomeAssistantError:
-                # The API stoped responding between the up checks an now
-                self._error_state = True
-                return
-
-            # Verify that the frontend is loaded
-            if "frontend" not in data.get("components", []):
-                _LOGGER.error("API responds but frontend is not loaded")
-                self._error_state = True
-            # Check that the frontend is actually accessible
-            elif not await self.sys_homeassistant.api.check_frontend_available():
-                _LOGGER.error(
-                    "Frontend component loaded but frontend is not accessible"
-                )
+                # The API stopped responding between the update and now
                 self._error_state = True
             else:
-                return
+                # Verify that the frontend is loaded
+                if "frontend" not in data.get("components", []):
+                    _LOGGER.error("API responds but frontend is not loaded")
+                    self._error_state = True
+                # Check that the frontend is actually accessible
+                elif not await self.sys_homeassistant.api.check_frontend_available():
+                    _LOGGER.error(
+                        "Frontend component loaded but frontend is not accessible"
+                    )
+                    self._error_state = True
+                else:
+                    # Health checks passed, clean up old image
+                    with suppress(DockerError):
+                        await self.instance.cleanup(old_image=old_image)
+                    return
 
         # Update going wrong, revert it
         if self.error_state and rollback:
@@ -506,7 +506,7 @@ class HomeAssistantCore(JobGroup):
             raise HomeAssistantError("Fatal error on config check!", _LOGGER.error)
 
         # Convert output
-        log = remove_colors("\n".join(result.log))
+        log = remove_colors("".join(result.log))
         _LOGGER.debug("Result config check: %s", log.strip())
 
         # Parse output

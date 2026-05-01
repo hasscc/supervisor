@@ -22,7 +22,6 @@ from ..exceptions import (
 )
 from ..jobs.const import JobConcurrency, JobCondition
 from ..jobs.decorator import Job
-from ..utils.sentry import async_capture_exception
 from .data_disk import DataDisk
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -122,7 +121,7 @@ class OSManager(CoreSysAttributes):
                 and self.latest_version is not None
                 and self.version < self.latest_version
             )
-        except (AwesomeVersionException, TypeError):
+        except AwesomeVersionException, TypeError:
             return False
 
     @property
@@ -206,7 +205,9 @@ class OSManager(CoreSysAttributes):
             _LOGGER.info("Completed download of OTA update file %s", raucb)
 
         except (aiohttp.ClientError, TimeoutError) as err:
-            self.sys_supervisor.connectivity = False
+            # Nudge a fresh connectivity check; the probe is authoritative,
+            # this error path only hints that something may be wrong.
+            self.sys_supervisor.request_connectivity_check()
             raise HassOSUpdateError(
                 f"Can't fetch OTA update from {url}: {err!s}", _LOGGER.error
             ) from err
@@ -363,7 +364,6 @@ class OSManager(CoreSysAttributes):
                 RaucState.ACTIVE, self.get_slot_name(boot_name)
             )
         except DBusError as err:
-            await async_capture_exception(err)
             raise HassOSSlotUpdateError(
                 f"Can't mark {boot_name} as active!", _LOGGER.error
             ) from err

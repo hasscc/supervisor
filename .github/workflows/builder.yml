@@ -42,7 +42,10 @@ env:
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: true
+  # Cancel in-progress runs only for PRs; queue runs on main so that wheels
+  # builds published from sequential merges don't clobber each other and leave
+  # downstream CI without the wheels for the latest requirements.txt.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   init:
@@ -137,7 +140,7 @@ jobs:
           requirements: "requirements.txt"
 
       - name: Build local wheels
-        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true'
+        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'false-disabled'
         uses: home-assistant/wheels@e5742a69d69f0e274e2689c998900c7d19652c21 # 2025.12.0
         with:
           wheels-host: ""
@@ -154,7 +157,7 @@ jobs:
 
       - name: Upload local wheels artifact
         if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'false'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.arch }}
           path: wheels
@@ -219,16 +222,14 @@ jobs:
 
   version:
     name: Update version
-    if: github.repository_owner == 'home-assistant'
+    if: github.repository_owner == 'home-assistant' && needs.init.outputs.publish == 'true'
     needs: ["init", "run_supervisor"]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
-        if: needs.init.outputs.publish == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Initialize git
-        if: needs.init.outputs.publish == 'true'
         uses: home-assistant/actions/helpers/git-init@master
         with:
           name: ${{ secrets.GIT_NAME }}
@@ -236,7 +237,6 @@ jobs:
           token: ${{ secrets.GIT_TOKEN }}
 
       - name: Update version file
-        if: needs.init.outputs.publish == 'none'
         uses: home-assistant/actions/helpers/version-push@master
         with:
           key: ${{ env.BUILD_NAME }}
@@ -285,9 +285,10 @@ jobs:
             --privileged \
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
-            -v /run/docker.sock:/run/docker.sock \
-            -v /run/dbus:/run/dbus \
-            -v /tmp/supervisor/data:/data \
+            -v /run/docker.sock:/run/docker.sock:rw \
+            -v /run/dbus:/run/dbus:ro \
+            -v /run/supervisor:/run/os:rw \
+            -v /tmp/supervisor/data:/data:rw,slave \
             -v /etc/machine-id:/etc/machine-id:ro \
             -e SUPERVISOR_SHARE="/tmp/supervisor/data" \
             -e SUPERVISOR_NAME=hassio_supervisor \

@@ -1,6 +1,7 @@
 """Filter tools."""
 
 import ipaddress
+import logging
 import os
 import re
 from typing import cast
@@ -11,7 +12,10 @@ from sentry_sdk.types import Event, Hint
 
 from ..const import DOCKER_IPV4_NETWORK_MASK, HEADER_TOKEN, HEADER_TOKEN_OLD, CoreState
 from ..coresys import CoreSys
-from ..exceptions import AddonConfigurationError
+from ..exceptions import APITooManyRequests, AppConfigurationError
+from ..utils import check_exception_chain
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 RE_URL: re.Pattern = re.compile(r"(\w+:\/\/)(.*\.\w+)(.*)")
 
@@ -43,10 +47,15 @@ def sanitize_url(url: str) -> str:
 
 def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
     """Filter event data before sending to sentry."""
-    # Ignore some  exceptions
+    # Ignore some exceptions. check_exception_chain walks __cause__ so
+    # wrapped rate limits (e.g. DockerHubRateLimitExceeded wrapped in
+    # SupervisorUpdateError via `raise X from err`) are also dropped.
     if "exc_info" in hint:
         _, exc_value, _ = hint["exc_info"]
-        if isinstance(exc_value, (AddonConfigurationError)):
+        if exc_value is not None and check_exception_chain(
+            exc_value, (AppConfigurationError, APITooManyRequests)
+        ):
+            _LOGGER.debug("Skipping Sentry event for %s", type(exc_value).__name__)
             return None
 
     # Ignore issue if system is not supported or diagnostics is disabled
@@ -82,10 +91,10 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
             )
         return event
 
-    # List installed addons
-    installed_addons = [
-        {"slug": addon.slug, "repository": addon.repository, "name": addon.name}
-        for addon in coresys.addons.installed
+    # List installed apps
+    installed_apps = [
+        {"slug": app.slug, "repository": app.repository, "name": app.name}
+        for app in coresys.apps.installed
     ]
 
     # Update information
@@ -93,7 +102,7 @@ def filter_data(coresys: CoreSys, event: Event, hint: Hint) -> Event | None:
         {
             "supervisor": {
                 "channel": coresys.updater.channel,
-                "installed_addons": installed_addons,
+                "installed_addons": installed_apps,
             },
             "host": {
                 "arch": str(coresys.arch.default),
