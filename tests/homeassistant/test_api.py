@@ -3,7 +3,6 @@
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aiohttp import hdrs
 from awesomeversion import AwesomeVersion
 import pytest
 
@@ -16,49 +15,6 @@ from supervisor.homeassistant.api import APIState, HomeAssistantAPI
 from supervisor.homeassistant.const import LANDINGPAGE
 
 from tests.common import MockResponse
-
-# --- check_frontend_available ---
-
-
-@pytest.mark.parametrize(
-    ("status", "content_type", "expected"),
-    [
-        (200, "text/html; charset=utf-8", True),
-        (404, "text/html", False),
-        (200, "application/json", False),
-    ],
-)
-async def test_check_frontend_available(
-    coresys: CoreSys, status: int, content_type: str, expected: bool
-):
-    """Test frontend availability based on HTTP status and content type."""
-    mock_response = MagicMock()
-    mock_response.status = status
-    mock_response.headers = {hdrs.CONTENT_TYPE: content_type}
-
-    @asynccontextmanager
-    async def mock_make_request(*args, **kwargs):
-        yield mock_response
-
-    with patch.object(
-        type(coresys.homeassistant.api), "make_request", new=mock_make_request
-    ):
-        assert await coresys.homeassistant.api.check_frontend_available() is expected
-
-
-async def test_check_frontend_available_api_error(coresys: CoreSys):
-    """Test frontend availability check handles API errors gracefully."""
-
-    @asynccontextmanager
-    async def mock_make_request(*args, **kwargs):
-        raise HomeAssistantAPIError("Connection failed")
-        yield  # pragma: no cover
-
-    with patch.object(
-        type(coresys.homeassistant.api), "make_request", new=mock_make_request
-    ):
-        assert await coresys.homeassistant.api.check_frontend_available() is False
-
 
 # --- get_config / get_core_state ---
 
@@ -149,6 +105,9 @@ async def test_get_config_api_error(coresys: CoreSys):
     [
         ("2026.4.0", True, True),
         ("2026.4.0", False, False),
+        ("2026.5.1", True, True),
+        ("2026.5.1", False, True),
+        ("2026.6.0", False, True),
         ("2024.1.0", True, False),
         (LANDINGPAGE, True, False),
     ],

@@ -45,6 +45,7 @@ from .const import (
     WATCHDOG_THROTTLE_MAX_CALLS,
     WATCHDOG_THROTTLE_PERIOD,
 )
+from .frontend_check import verify_frontend
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -279,7 +280,9 @@ class HomeAssistantCore(JobGroup):
             )
 
         old_image = self.sys_homeassistant.image
-        rollback = self.sys_homeassistant.version if not self.error_state else None
+        rollback_version = (
+            self.sys_homeassistant.version if not self.error_state else None
+        )
         running = await self.instance.is_running()
         exists = await self.instance.exists()
 
@@ -326,31 +329,43 @@ class HomeAssistantCore(JobGroup):
         with suppress(HomeAssistantError):
             await _update(to_version)
 
-        if not self.error_state and rollback:
+        # If Core wasn't running on entry, the caller is responsible for
+        # starting it (e.g. backup restore, which stops and removes Core
+        # before calling update() and starts it later in its own stage).
+        # _update() correspondingly skipped the start step, so there is no
+        # running Core to health-check. Returning early avoids a spurious
+        # rollback that would otherwise overwrite the freshly installed
+        # image with the previous version.
+        if not running:
+            return
+
+        if not self.error_state and rollback_version:
             try:
                 data = await self.sys_homeassistant.api.get_config()
             except HomeAssistantError:
                 # The API stopped responding between the update and now
                 self._error_state = True
             else:
-                # Verify that the frontend is loaded
-                if "frontend" not in data.get("components", []):
-                    _LOGGER.error("API responds but frontend is not loaded")
+                components = data.get("components", [])
+                # Verify that the integrations needed to serve the frontend
+                # are loaded
+                for required in ("http", "frontend", "websocket_api"):
+                    if required not in components:
+                        _LOGGER.error("API responds but %s is not loaded", required)
+                        self._error_state = True
+                # Probe the public HTTP/WS endpoints as an external client
+                # would, to catch cases where integrations are listed as
+                # loaded but the endpoints don't actually function.
+                if not self._error_state and not await verify_frontend(self.coresys):
                     self._error_state = True
-                # Check that the frontend is actually accessible
-                elif not await self.sys_homeassistant.api.check_frontend_available():
-                    _LOGGER.error(
-                        "Frontend component loaded but frontend is not accessible"
-                    )
-                    self._error_state = True
-                else:
+                if not self._error_state:
                     # Health checks passed, clean up old image
                     with suppress(DockerError):
                         await self.instance.cleanup(old_image=old_image)
                     return
 
         # Update going wrong, revert it
-        if self.error_state and rollback:
+        if self.error_state and rollback_version:
             _LOGGER.critical("HomeAssistant update failed -> rollback!")
             self.sys_resolution.create_issue(
                 IssueType.UPDATE_ROLLBACK, ContextType.CORE
@@ -367,7 +382,7 @@ class HomeAssistantCore(JobGroup):
                 _LOGGER.info(
                     "A backup of the logfile is stored in /config/home-assistant-rollback.log"
                 )
-            await _update(rollback)
+            await _update(rollback_version)
         else:
             self.sys_resolution.create_issue(IssueType.UPDATE_FAILED, ContextType.CORE)
             raise HomeAssistantUpdateError()

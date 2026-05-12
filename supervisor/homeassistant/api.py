@@ -27,6 +27,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 CORE_UNIX_SOCKET_MIN_VERSION: AwesomeVersion = AwesomeVersion(
     "2026.4.0.dev202603250907"
 )
+CORE_UNIX_SOCKET_DEFAULT_VERSION: AwesomeVersion = AwesomeVersion("2026.5.1")
 GET_CORE_STATE_MIN_VERSION: AwesomeVersion = AwesomeVersion("2023.8.0.dev20230720")
 
 
@@ -56,15 +57,26 @@ class HomeAssistantAPI(CoreSysAttributes):
     def supports_unix_socket(self) -> bool:
         """Return True if the installed Core version supports Unix socket communication.
 
+        Enabled by default for Core >= CORE_UNIX_SOCKET_DEFAULT_VERSION; for
+        older versions down to CORE_UNIX_SOCKET_MIN_VERSION it is gated behind
+        the UNIX_SOCKET_CORE_API feature flag.
+
         Used to decide whether to configure the env var when starting Core.
         """
-        return (
-            self.sys_config.feature_flags.get(FeatureFlag.UNIX_SOCKET_CORE_API, False)
-            and self.sys_homeassistant.version is not None
-            and self.sys_homeassistant.version != LANDINGPAGE
-            and version_is_new_enough(
+        if (
+            self.sys_homeassistant.version is None
+            or self.sys_homeassistant.version == LANDINGPAGE
+            or not version_is_new_enough(
                 self.sys_homeassistant.version, CORE_UNIX_SOCKET_MIN_VERSION
             )
+        ):
+            return False
+        if version_is_new_enough(
+            self.sys_homeassistant.version, CORE_UNIX_SOCKET_DEFAULT_VERSION
+        ):
+            return True
+        return self.sys_config.feature_flags.get(
+            FeatureFlag.UNIX_SOCKET_CORE_API, False
         )
 
     @property
@@ -368,32 +380,3 @@ class HomeAssistantAPI(CoreSysAttributes):
         if state := await self.get_api_state():
             return state.core_state == "RUNNING" or state.offline_db_migration
         return False
-
-    async def check_frontend_available(self) -> bool:
-        """Check if the frontend is accessible by fetching the root path.
-
-        Caller should make sure that Home Assistant Core is running before
-        calling this method.
-
-        Returns:
-            True if the frontend responds successfully, False otherwise.
-
-        """
-        try:
-            async with self.make_request("get", "", timeout=30) as resp:
-                # Frontend should return HTML content
-                if resp.status == 200:
-                    content_type = resp.headers.get(hdrs.CONTENT_TYPE, "")
-                    if "text/html" in content_type:
-                        _LOGGER.debug("Frontend is accessible and serving HTML")
-                        return True
-                    _LOGGER.warning(
-                        "Frontend responded but with unexpected content type: %s",
-                        content_type,
-                    )
-                    return False
-                _LOGGER.warning("Frontend returned status %s", resp.status)
-                return False
-        except HomeAssistantAPIError as err:
-            _LOGGER.debug("Cannot reach frontend: %s", err)
-            return False

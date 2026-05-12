@@ -431,7 +431,7 @@ async def test_install_fires_progress_events(
         )
         coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(0)
     assert events == [
         PullLogEntry(
             job_id=ANY,
@@ -856,8 +856,8 @@ async def test_install_progress_containerd_snapshot(
     """Test install handles docker progress events using containerd snapshotter."""
     coresys.core.set_state(CoreState.RUNNING)
 
-    class TestDockerInterface(DockerInterface):
-        """Test interface for events."""
+    class FakeDockerInterface(DockerInterface):
+        """Fake interface for events."""
 
         @property
         def name(self) -> str:
@@ -880,7 +880,7 @@ async def test_install_progress_containerd_snapshot(
     # Should not error but progress gets choppier once extraction starts
     logs = load_json_fixture("docker_pull_image_log_containerd_snapshot.json")
     coresys.docker.images.pull.return_value = AsyncIterator(logs)
-    test_docker_interface = TestDockerInterface(coresys)
+    test_docker_interface = FakeDockerInterface(coresys)
 
     with patch.object(Supervisor, "arch", PropertyMock(return_value="amd64")):
         await test_docker_interface.mock_install()
@@ -894,7 +894,7 @@ async def test_install_progress_containerd_snapshot(
         )
         coresys.docker.images.inspect.assert_called_once_with("test:1.2.3")
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(0)
 
     def job_event(progress: float, done: bool = False):
         return {
