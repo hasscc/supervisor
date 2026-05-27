@@ -79,24 +79,29 @@ def _restart_policy_from_model(meta_host: dict[str, Any]) -> RestartPolicy | Non
     return RestartPolicy.NO
 
 
-def _container_state_from_model(container_metadata: dict[str, Any]) -> ContainerState:
-    """Get container state from model."""
+def _container_state_from_model(
+    container_metadata: dict[str, Any],
+) -> tuple[ContainerState, int | None]:
+    """Get container state and exit code from model."""
     if "State" not in container_metadata:
-        return ContainerState.UNKNOWN
+        return ContainerState.UNKNOWN, None
 
-    if container_metadata["State"]["Status"] == "running":
-        if "Health" in container_metadata["State"]:
+    state_obj = container_metadata["State"]
+    if state_obj["Status"] == "running":
+        if "Health" in state_obj:
             return (
                 ContainerState.HEALTHY
-                if container_metadata["State"]["Health"]["Status"] == "healthy"
-                else ContainerState.UNHEALTHY
+                if state_obj["Health"]["Status"] == "healthy"
+                else ContainerState.UNHEALTHY,
+                None,
             )
-        return ContainerState.RUNNING
+        return ContainerState.RUNNING, None
 
-    if container_metadata["State"]["ExitCode"] > 0:
-        return ContainerState.FAILED
+    exit_code = state_obj["ExitCode"]
+    if exit_code > 0:
+        return ContainerState.FAILED, exit_code
 
-    return ContainerState.STOPPED
+    return ContainerState.STOPPED, None
 
 
 class DockerInterface(JobGroup, ABC):
@@ -223,10 +228,11 @@ class DockerInterface(JobGroup, ABC):
             if registry in (DOCKER_HUB, DOCKER_HUB_LEGACY):
                 qualified_image = f"{DOCKER_HUB}/{image}"
 
-            _LOGGER.debug(
-                "Logging in to %s as %s",
+            _LOGGER.info(
+                "Using stored registry credentials for %s (user: %s) to pull %s",
                 registry,
                 stored[ATTR_USERNAME],
+                image,
             )
 
         return credentials, qualified_image
@@ -332,15 +338,17 @@ class DockerInterface(JobGroup, ABC):
                 )
                 await async_capture_exception(err)
 
+        # Get credentials for private registries to pass to aiodocker.
+        # Done before registering the listener so a failure here does not
+        # leak a stale event listener.
+        credentials, pull_image_name = self._get_credentials(image)
+
         listener = self.sys_bus.register_event(
             BusEvent.DOCKER_IMAGE_PULL_UPDATE, process_pull_event
         )
 
         _LOGGER.info("Downloading docker image %s with tag %s.", image, version)
         try:
-            # Get credentials for private registries to pass to aiodocker
-            credentials, pull_image_name = self._get_credentials(image)
-
             # Pull new image, passing credentials to aiodocker
             docker_image = await self.sys_docker.pull_image(
                 current_job.uuid,
@@ -420,7 +428,8 @@ class DockerInterface(JobGroup, ABC):
     async def current_state(self) -> ContainerState:
         """Return current state of container."""
         if container_metadata := await self._get_container():
-            return _container_state_from_model(container_metadata)
+            state, _ = _container_state_from_model(container_metadata)
+            return state
         return ContainerState.UNKNOWN
 
     @Job(name="docker_interface_attach", concurrency=JobConcurrency.GROUP_QUEUE)
@@ -433,7 +442,7 @@ class DockerInterface(JobGroup, ABC):
             self._meta = await docker_container.show()
             self.sys_docker.monitor.watch_container(self._meta)
 
-            state = _container_state_from_model(self._meta)
+            state, exit_code = _container_state_from_model(self._meta)
             if not (
                 skip_state_event_if_down
                 and state in [ContainerState.STOPPED, ContainerState.FAILED]
@@ -442,19 +451,24 @@ class DockerInterface(JobGroup, ABC):
                 self.sys_bus.fire_event(
                     BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
                     DockerContainerStateEvent(
-                        self.name, state, docker_container.id, int(time())
+                        self.name, state, docker_container.id, int(time()), exit_code
                     ),
                 )
 
-        with suppress(aiodocker.DockerError):
-            if not self._meta and self.image:
+        if not self._meta and self.image:
+            try:
                 self._meta = await self.sys_docker.images.inspect(
                     f"{self.image}:{version!s}"
                 )
+            except aiodocker.DockerError as err:
+                if err.status != HTTPStatus.NOT_FOUND:
+                    raise DockerAPIError(
+                        f"Docker API error inspecting image {self.image}:{version!s}: {err!s}"
+                    ) from err
 
         # Successful?
         if not self._meta:
-            raise DockerError(
+            raise DockerNotFound(
                 f"Could not get metadata on container or image for {self.name}"
             )
         _LOGGER.info("Attaching to %s with version %s", self.image, self.version)
@@ -466,7 +480,7 @@ class DockerInterface(JobGroup, ABC):
     )
     async def run(self) -> None:
         """Run Docker image."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
     async def _run(self, *, name: str, **kwargs) -> None:
         """Run Docker image with retry if necessary."""
@@ -550,7 +564,11 @@ class DockerInterface(JobGroup, ABC):
             try:
                 image = await self.sys_docker.images.inspect(image_name)
             except aiodocker.DockerError as err:
-                raise DockerError(
+                if err.status == HTTPStatus.NOT_FOUND:
+                    raise DockerNotFound(
+                        f"Image {image_name} not found", _LOGGER.info
+                    ) from err
+                raise DockerAPIError(
                     f"Could not get {image_name} for check due to: {err!s}",
                     _LOGGER.error,
                 ) from err
@@ -641,7 +659,7 @@ class DockerInterface(JobGroup, ABC):
     )
     async def execute_command(self, command: str) -> CommandReturn:
         """Create a temporary container and run command."""
-        raise NotImplementedError()
+        raise NotImplementedError
 
     async def stats(self) -> DockerStats:
         """Read and return stats from container."""
@@ -666,7 +684,7 @@ class DockerInterface(JobGroup, ABC):
                     available_version.append(version)
 
             if not available_version:
-                raise ValueError()
+                raise ValueError
 
         except (aiodocker.DockerError, ValueError) as err:
             raise DockerNotFound(

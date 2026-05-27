@@ -1,6 +1,7 @@
 """Test mounts API."""
 
 import asyncio
+import errno
 from unittest.mock import patch
 
 from aiohttp.test_utils import TestClient
@@ -34,7 +35,7 @@ async def fixture_mount(
     coresys.mounts._mounts = {"backup_test": mount}  # pylint: disable=protected-access
     coresys.mounts.default_backup_mount = mount
     await coresys.mounts.load()
-    yield mount
+    return mount
 
 
 async def test_api_mounts_info(api_client_with_prefix: tuple[TestClient, str]):
@@ -382,9 +383,21 @@ async def test_api_reload_mount(
     systemd_service: SystemdService = all_dbus_services["systemd"]
     systemd_service.ReloadOrRestartUnit.calls.clear()
 
+    # Healthy mount (probe passes): API reload completes without touching
+    # systemd — the periodic refresh + probe-as-fast-path means a healthy
+    # mount only gets reloaded when the share has actually gone bad.
     resp = await api_client.post(f"{prefix}/mounts/backup_test/reload")
     result = await resp.json()
     assert result["result"] == "ok"
+    assert systemd_service.ReloadOrRestartUnit.calls == []
+
+    # Probe failure forces the reload to actually go to systemd.
+    with patch(
+        "supervisor.mounts.mount._probe_network_mount",
+        side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+    ):
+        resp = await api_client.post(f"{prefix}/mounts/backup_test/reload")
+        await resp.json()
 
     assert systemd_service.ReloadOrRestartUnit.calls == [
         ("mnt-data-supervisor-mounts-backup_test.mount", "fail")

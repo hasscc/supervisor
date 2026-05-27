@@ -30,6 +30,7 @@ from ..exceptions import (
     HomeAssistantStartupTimeout,
     HomeAssistantUpdateError,
     JobException,
+    SupervisorUpdateError,
 )
 from ..jobs import ChildJobSyncFilter
 from ..jobs.const import JOB_GROUP_HOME_ASSISTANT_CORE, JobConcurrency, JobThrottle
@@ -50,6 +51,7 @@ from .frontend_check import verify_frontend
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 SECONDS_BETWEEN_API_CHECKS: Final[int] = 5
+INSTALL_RETRY_WAIT_SECS: Final[int] = 30
 # Core Stage 1 and some wiggle room
 STARTUP_API_RESPONSE_TIMEOUT: Final[timedelta] = timedelta(minutes=10)
 # All stages plus event start timeout and some wiggle rooom
@@ -154,9 +156,10 @@ class HomeAssistantCore(JobGroup):
         while True:
             if not self.sys_updater.image_homeassistant:
                 _LOGGER.warning(
-                    "Found no information about Home Assistant. Retrying in 30sec"
+                    "Updater has no Home Assistant image information yet. Retrying in %ssec",
+                    INSTALL_RETRY_WAIT_SECS,
                 )
-                await asyncio.sleep(30)
+                await asyncio.sleep(INSTALL_RETRY_WAIT_SECS)
                 await self.sys_updater.reload()
                 continue
 
@@ -165,13 +168,16 @@ class HomeAssistantCore(JobGroup):
                     LANDINGPAGE, image=self.sys_updater.image_homeassistant
                 )
                 break
-            except (DockerError, JobException):
+            except DockerError, JobException:
                 pass
             except Exception as err:  # pylint: disable=broad-except
                 await async_capture_exception(err)
 
-            _LOGGER.warning("Failed to install landingpage, retrying after 30sec")
-            await asyncio.sleep(30)
+            _LOGGER.warning(
+                "Failed to install landingpage, retrying after %ssec",
+                INSTALL_RETRY_WAIT_SECS,
+            )
+            await asyncio.sleep(INSTALL_RETRY_WAIT_SECS)
 
         self.sys_homeassistant.version = LANDINGPAGE
         self.sys_homeassistant.set_image(self.sys_updater.image_homeassistant)
@@ -208,25 +214,57 @@ class HomeAssistantCore(JobGroup):
                 if not self.sys_homeassistant.latest_version:
                     await self.sys_updater.reload()
 
-                if to_version := self.sys_homeassistant.latest_version:
-                    try:
-                        await self.instance.update(
-                            to_version,
-                            image=self.sys_updater.image_homeassistant,
+                if not (to_version := self.sys_homeassistant.latest_version):
+                    _LOGGER.warning(
+                        "Updater has no Home Assistant version information yet. Retrying in"
+                        " %ssec",
+                        INSTALL_RETRY_WAIT_SECS,
+                    )
+                    await asyncio.sleep(INSTALL_RETRY_WAIT_SECS)
+                    continue
+
+                # Supervisor must always be updated before Core to avoid
+                # incompatibilities between a newer Core and an older Supervisor.
+                if self.sys_supervisor.need_update:
+                    if self.sys_updater.auto_update:
+                        _LOGGER.info(
+                            "Supervisor has a pending update and must be updated"
+                            " before installing Home Assistant Core. Updating Supervisor first"
                         )
-                        self.sys_homeassistant.version = (
-                            self.instance.version or to_version
+                        try:
+                            await self.sys_supervisor.update()
+                        except SupervisorUpdateError as err:
+                            _LOGGER.warning(
+                                "Supervisor update failed, retrying in %ssec: %s",
+                                INSTALL_RETRY_WAIT_SECS,
+                                err,
+                            )
+                            await asyncio.sleep(INSTALL_RETRY_WAIT_SECS)
+                            continue
+                    else:
+                        _LOGGER.warning(
+                            "Supervisor has a pending update but auto-update is"
+                            " disabled. Installing Home Assistant Core anyway —"
+                            " unknown issues may occur"
                         )
-                        break
-                    except (DockerError, JobException):
-                        pass
-                    except Exception as err:  # pylint: disable=broad-except
-                        await async_capture_exception(err)
+
+                try:
+                    await self.instance.update(
+                        to_version,
+                        image=self.sys_updater.image_homeassistant,
+                    )
+                    self.sys_homeassistant.version = self.instance.version or to_version
+                    break
+                except DockerError, JobException:
+                    pass
+                except Exception as err:  # pylint: disable=broad-except
+                    await async_capture_exception(err)
 
                 _LOGGER.warning(
-                    "Error on Home Assistant installation. Retrying in 30sec"
+                    "Error on Home Assistant installation. Retrying in %ssec",
+                    INSTALL_RETRY_WAIT_SECS,
                 )
-                await asyncio.sleep(30)
+                await asyncio.sleep(INSTALL_RETRY_WAIT_SECS)
         finally:
             stop_progress_log.set()
             await progress_task
@@ -385,7 +423,7 @@ class HomeAssistantCore(JobGroup):
             await _update(rollback_version)
         else:
             self.sys_resolution.create_issue(IssueType.UPDATE_FAILED, ContextType.CORE)
-            raise HomeAssistantUpdateError()
+            raise HomeAssistantUpdateError
 
     @Job(
         name="home_assistant_core_start",
@@ -403,7 +441,7 @@ class HomeAssistantCore(JobGroup):
             try:
                 await self.instance.start()
             except DockerError as err:
-                raise HomeAssistantError() from err
+                raise HomeAssistantError from err
 
             await self._block_till_run()
         # No Instance/Container found, extended start
@@ -418,7 +456,7 @@ class HomeAssistantCore(JobGroup):
             try:
                 await self.instance.run(restore_job_id=self.sys_backups.current_restore)
             except DockerError as err:
-                raise HomeAssistantError() from err
+                raise HomeAssistantError from err
 
             await self._block_till_run()
 
@@ -432,7 +470,7 @@ class HomeAssistantCore(JobGroup):
         try:
             return await self.instance.stop(remove_container=remove_container)
         except DockerError as err:
-            raise HomeAssistantError() from err
+            raise HomeAssistantError from err
 
     @Job(
         name="home_assistant_core_restart",
@@ -451,7 +489,7 @@ class HomeAssistantCore(JobGroup):
         try:
             await self.instance.restart()
         except DockerError as err:
-            raise HomeAssistantError() from err
+            raise HomeAssistantError from err
 
         await self._block_till_run()
 
@@ -478,7 +516,7 @@ class HomeAssistantCore(JobGroup):
         try:
             return await self.instance.stats()
         except DockerError as err:
-            raise HomeAssistantError() from err
+            raise HomeAssistantError from err
 
     def is_running(self) -> Awaitable[bool]:
         """Return True if Docker container is running.
@@ -514,7 +552,7 @@ class HomeAssistantCore(JobGroup):
                 ]
             )
         except DockerError as err:
-            raise HomeAssistantError() from err
+            raise HomeAssistantError from err
 
         # If not valid
         if result.exit_code is None:
@@ -575,7 +613,7 @@ class HomeAssistantCore(JobGroup):
                 "No Home Assistant Core response, assuming a fatal startup error",
                 _LOGGER.error,
             )
-        raise HomeAssistantCrashError()
+        raise HomeAssistantCrashError
 
     @Job(
         name="home_assistant_core_repair",

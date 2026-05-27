@@ -7,8 +7,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 import pytest
 
-from supervisor.addons.addon import App
 from supervisor.api import RestAPI
+from supervisor.apps.app import App
 from supervisor.const import REQUEST_FROM, FeatureFlag
 from supervisor.coresys import CoreSys
 from supervisor.host.const import LogFormat, LogFormatter
@@ -181,7 +181,7 @@ async def fixture_api_client_v2(aiohttp_client, coresys: CoreSys) -> TestClient:
     api.webapp = web.Application(middlewares=[_security_middleware])
     api.start = AsyncMock()
     await api.load()
-    yield await aiohttp_client(api.webapp)
+    return await aiohttp_client(api.webapp)
 
 
 @pytest.fixture(

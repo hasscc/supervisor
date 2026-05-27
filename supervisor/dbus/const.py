@@ -50,6 +50,7 @@ DBUS_SIGNAL_NM_CONNECTION_ACTIVE_CHANGED = (
 )
 DBUS_SIGNAL_PROPERTIES_CHANGED = "org.freedesktop.DBus.Properties.PropertiesChanged"
 DBUS_SIGNAL_RAUC_INSTALLER_COMPLETED = "de.pengutronix.rauc.Installer.Completed"
+DBUS_SIGNAL_SYSTEMD_JOB_REMOVED = "org.freedesktop.systemd1.Manager.JobRemoved"
 
 DBUS_OBJECT_BASE = "/"
 DBUS_OBJECT_DNS = "/org/freedesktop/NetworkManager/DnsManager"
@@ -191,6 +192,7 @@ DBUS_ATTR_SWAP_SIZE = "SwapSize"
 DBUS_ATTR_SWAPPINESS = "Swappiness"
 DBUS_ATTR_TABLE = "Table"
 DBUS_ATTR_TIME_DETECTED = "TimeDetected"
+DBUS_ATTR_TIMEOUT_USEC = "TimeoutUSec"
 DBUS_ATTR_TIMEUSEC = "TimeUSec"
 DBUS_ATTR_TIMEZONE = "Timezone"
 DBUS_ATTR_TRANSACTION_STATISTICS = "TransactionStatistics"

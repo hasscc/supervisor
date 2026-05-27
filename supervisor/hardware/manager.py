@@ -102,7 +102,7 @@ class HardwareManager(CoreSysAttributes):
                 return device
             if device_node in device.links:
                 return device
-        raise HardwareNotFound()
+        raise HardwareNotFound
 
     def filter_devices(self, subsystem: UdevSubsystem | None = None) -> list[Device]:
         """Return a filtered list."""
@@ -161,6 +161,7 @@ class HardwareManager(CoreSysAttributes):
     async def load(self) -> None:
         """Load hardware backend."""
         self._import_devices()
+        await self.helper.load()
         await self.monitor.load()
 
     async def unload(self) -> None:

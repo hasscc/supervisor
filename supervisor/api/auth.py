@@ -12,7 +12,7 @@ from aiohttp.web_exceptions import HTTPUnauthorized
 from multidict import MultiDictProxy
 import voluptuous as vol
 
-from ..addons.addon import App
+from ..apps.app import App
 from ..const import ATTR_NAME, ATTR_PASSWORD, ATTR_USERNAME, REQUEST_FROM
 from ..coresys import CoreSysAttributes
 from ..exceptions import APIForbidden, AuthInvalidNonStringValueError
@@ -96,14 +96,14 @@ class APIAuth(CoreSysAttributes):
         if request.headers.get(CONTENT_TYPE) == CONTENT_TYPE_JSON:
             data = await request.json(loads=json_loads)
             if not await self._process_dict(request, app, data):
-                raise HTTPUnauthorized()
+                raise HTTPUnauthorized
             return True
 
         # URL encoded
         if request.headers.get(CONTENT_TYPE) == CONTENT_TYPE_URL:
             data = await request.post()
             if not await self._process_dict(request, app, data):
-                raise HTTPUnauthorized()
+                raise HTTPUnauthorized
             return True
 
         # Advertise Basic authentication by default

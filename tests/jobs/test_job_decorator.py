@@ -56,7 +56,7 @@ async def test_healthy(coresys: CoreSys, caplog: pytest.LogCaptureFixture):
 
 
 @pytest.mark.parametrize(
-    "connectivity,head_side_effect,host_result,system_result",
+    ("connectivity", "head_side_effect", "host_result", "system_result"),
     [
         (4, None, True, True),
         (4, ClientError(), True, None),
@@ -186,7 +186,7 @@ async def test_exception(coresys: CoreSys, capture_exception: Mock):
         @Job(name="test_exception_execute", conditions=[JobCondition.HEALTHY])
         async def execute(self):
             """Execute the class method."""
-            raise HassioError()
+            raise HassioError
 
     test = TestClass(coresys)
 

@@ -1,6 +1,7 @@
 """Test backups API."""
 
 import asyncio
+import errno
 from pathlib import Path, PurePath
 from shutil import copy
 from typing import Any
@@ -12,7 +13,7 @@ from aiohttp.test_utils import TestClient
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.addons.addon import App
+from supervisor.apps.app import App
 from supervisor.backups.backup import Backup, BackupLocation
 from supervisor.backups.manager import BackupManager
 from supervisor.const import CoreState
@@ -220,14 +221,18 @@ async def test_backup_to_down_mount_returns_400(
     await coresys.mounts.create_mount(mount)
     coresys.mounts.default_backup_mount = mount
 
-    mock_is_mount.return_value = False
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
 
-    resp = await api_client.post(
-        "/backups/new/full",
-        json={"name": "Mount test", "location": "backup_test"},
-    )
+    # Simulate the mount being down: probe (statvfs) fails with EHOSTDOWN.
+    with patch(
+        "supervisor.mounts.mount._probe_network_mount",
+        side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+    ):
+        resp = await api_client.post(
+            "/backups/new/full",
+            json={"name": "Mount test", "location": "backup_test"},
+        )
     assert resp.status == 400
     body = await resp.json()
     assert body["result"] == "error"
@@ -267,7 +272,7 @@ async def test_api_freeze_thaw(
 
 
 @pytest.mark.parametrize(
-    "partial_backup,exclude_db_setting",
+    ("partial_backup", "exclude_db_setting"),
     [(False, True), (True, True), (False, False), (True, False)],
 )
 @pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
@@ -305,7 +310,7 @@ async def _get_job_info(api_client: TestClient, job_id: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    "backup_type,options",
+    ("backup_type", "options"),
     [
         ("full", {}),
         (
@@ -391,7 +396,7 @@ async def test_api_backup_restore_background(
 
 
 @pytest.mark.parametrize(
-    "backup_type,options",
+    ("backup_type", "options"),
     [
         ("full", {}),
         (

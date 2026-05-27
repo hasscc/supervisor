@@ -8,14 +8,14 @@ from unittest.mock import PropertyMock, patch
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.addons.addon import App
+from supervisor.apps.app import App
 from supervisor.arch import CpuArchManager
 from supervisor.backups.manager import BackupManager
 from supervisor.coresys import CoreSys
 from supervisor.exceptions import AppNotSupportedError, StoreJobError
 from supervisor.homeassistant.module import HomeAssistant
 from supervisor.store import StoreManager
-from supervisor.store.addon import AppStore
+from supervisor.store.app import AppStore
 from supervisor.store.git import GitRepo
 from supervisor.store.repository import Repository
 
@@ -124,23 +124,23 @@ async def test_reload_fails_if_out_of_date(coresys: CoreSys):
 
 
 @pytest.mark.parametrize(
-    "config,log",
+    ("config", "log"),
     [
         (
             {"arch": ["aarch64"]},
-            "App local_ssh not supported on this platform, supported architectures: aarch64",
+            "App Terminal & SSH not supported on this platform, supported architectures: aarch64",
         ),
         (
             {"machine": ["odroid-n2"]},
-            "App local_ssh not supported on this machine, supported machine types: odroid-n2",
+            "App Terminal & SSH not supported on this machine, supported machine types: odroid-n2",
         ),
         (
             {"machine": ["!qemux86-64"]},
-            "App local_ssh not supported on this machine, supported machine types: !qemux86-64",
+            "App Terminal & SSH not supported on this machine, supported machine types: !qemux86-64",
         ),
         (
             {"homeassistant": AwesomeVersion("2023.1.1")},
-            "App local_ssh not supported on this system, requires Home Assistant version 2023.1.1 or greater",
+            "App Terminal & SSH not supported on this system, requires Home Assistant version 2023.1.1 or greater",
         ),
     ],
 )
@@ -153,9 +153,7 @@ async def test_update_unavailable_app(
 ):
     """Test updating app when new version not available for system."""
     app_config = dict(
-        await coresys.run_in_executor(
-            load_yaml_fixture, "addons/local/ssh/config.yaml"
-        ),
+        await coresys.run_in_executor(load_yaml_fixture, "apps/local/ssh/config.yaml"),
         version=AwesomeVersion("10.0.0"),
         **config,
     )
@@ -183,23 +181,23 @@ async def test_update_unavailable_app(
 
 
 @pytest.mark.parametrize(
-    "config,log",
+    ("config", "log"),
     [
         (
             {"arch": ["aarch64"]},
-            "App local_ssh not supported on this platform, supported architectures: aarch64",
+            "App Terminal & SSH not supported on this platform, supported architectures: aarch64",
         ),
         (
             {"machine": ["odroid-n2"]},
-            "App local_ssh not supported on this machine, supported machine types: odroid-n2",
+            "App Terminal & SSH not supported on this machine, supported machine types: odroid-n2",
         ),
         (
             {"machine": ["!qemux86-64"]},
-            "App local_ssh not supported on this machine, supported machine types: !qemux86-64",
+            "App Terminal & SSH not supported on this machine, supported machine types: !qemux86-64",
         ),
         (
             {"homeassistant": AwesomeVersion("2023.1.1")},
-            "App local_ssh not supported on this system, requires Home Assistant version 2023.1.1 or greater",
+            "App Terminal & SSH not supported on this system, requires Home Assistant version 2023.1.1 or greater",
         ),
     ],
 )
@@ -212,9 +210,7 @@ async def test_install_unavailable_app(
 ):
     """Test updating app when new version not available for system."""
     app_config = dict(
-        await coresys.run_in_executor(
-            load_yaml_fixture, "addons/local/ssh/config.yaml"
-        ),
+        await coresys.run_in_executor(load_yaml_fixture, "apps/local/ssh/config.yaml"),
         version=AwesomeVersion("10.0.0"),
         **config,
     )

@@ -13,15 +13,15 @@ from awesomeversion import AwesomeVersion
 from dbus_fast import DBusError
 import pytest
 
-from supervisor.addons.addon import App
-from supervisor.addons.const import AppBackupMode
-from supervisor.addons.model import AppModel
+from supervisor.apps.app import App
+from supervisor.apps.const import AppBackupMode
+from supervisor.apps.model import AppModel
 from supervisor.backups.backup import Backup, BackupLocation
 from supervisor.backups.const import LOCATION_TYPE, BackupJobStage, BackupType
 from supervisor.backups.manager import BackupManager
 from supervisor.const import FOLDER_HOMEASSISTANT, FOLDER_SHARE, AppState, CoreState
 from supervisor.coresys import CoreSys
-from supervisor.docker.addon import DockerApp
+from supervisor.docker.app import DockerApp
 from supervisor.docker.const import ContainerState
 from supervisor.docker.homeassistant import DockerHomeAssistant
 from supervisor.docker.monitor import DockerContainerStateEvent
@@ -800,16 +800,20 @@ async def test_backup_to_down_mount_error(coresys: CoreSys, mock_is_mount: Magic
     assert "backup_test" in coresys.backups.backup_locations
     assert coresys.backups.backup_locations["backup_test"] == mount_dir
 
-    # Attempt to make a backup which fails because is_mount on directory is false
-    mock_is_mount.return_value = False
+    # Attempt to make a backup which fails because the probe (statvfs)
+    # surfaces the server as unreachable.
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
-    with pytest.raises(BackupMountDownError):
-        await coresys.backups.do_backup_full("test", location=mount)
-    with pytest.raises(BackupMountDownError):
-        await coresys.backups.do_backup_partial(
-            "test", location=mount, homeassistant=True
-        )
+    with patch(
+        "supervisor.mounts.mount._probe_network_mount",
+        side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+    ):
+        with pytest.raises(BackupMountDownError):
+            await coresys.backups.do_backup_full("test", location=mount)
+        with pytest.raises(BackupMountDownError):
+            await coresys.backups.do_backup_partial(
+                "test", location=mount, homeassistant=True
+            )
 
 
 @pytest.mark.usefixtures(
@@ -906,12 +910,18 @@ async def test_backup_to_default_mount_down_error(
     await coresys.mounts.create_mount(mount)
     coresys.mounts.default_backup_mount = mount
 
-    # Attempt to make a backup which fails because is_mount on directory is false
-    mock_is_mount.return_value = False
+    # Attempt to make a backup which fails because the probe (statvfs)
+    # surfaces the server as unreachable.
     await coresys.core.set_state(CoreState.RUNNING)
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
 
-    with pytest.raises(BackupMountDownError):
+    with (
+        patch(
+            "supervisor.mounts.mount._probe_network_mount",
+            side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+        ),
+        pytest.raises(BackupMountDownError),
+    ):
         await coresys.backups.do_backup_partial("test", homeassistant=True)
 
 
@@ -1143,7 +1153,7 @@ async def test_backup_progress(
             "backup_mode",
             new=PropertyMock(return_value=AppBackupMode.COLD),
         ),
-        patch("supervisor.addons.addon.asyncio.Event.wait"),
+        patch("supervisor.apps.app.asyncio.Event.wait"),
     ):
         full_backup: Backup = await coresys.backups.do_backup_full()
     await asyncio.sleep(0)
@@ -1263,7 +1273,7 @@ async def test_restore_progress(
     coresys.apps.local[store.slug] = App(coresys, store.slug)
 
     with (
-        patch("supervisor.addons.addon.asyncio.Event.wait"),
+        patch("supervisor.apps.app.asyncio.Event.wait"),
         patch.object(HomeAssistant, "restore"),
         patch.object(HomeAssistantCore, "update"),
         patch.object(AppModel, "_validate_availability"),
@@ -1634,6 +1644,36 @@ async def test_restore_new_app(coresys: CoreSys, install_app_example: App):
 
 
 @pytest.mark.usefixtures("supervisor_internet", "tmp_supervisor_data", "path_extern")
+async def test_restore_app_image_missing(coresys: CoreSys, install_app_example: App):
+    """Test restore when local image is missing installs from registry.
+
+    Exercises the ``not instance.exists()`` branch in ``App.restore()`` which
+    checks the extracted bundle for an ``image.tar`` to import. This path is
+    skipped by other restore tests because the mocked Docker image inspect
+    always reports the image as present.
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    backup: Backup = await coresys.backups.do_backup_partial(apps=["local_example"])
+    await coresys.apps.uninstall("local_example")
+    assert "local_example" not in coresys.apps.local
+
+    with (
+        patch.object(AppModel, "_validate_availability"),
+        patch.object(DockerApp, "attach"),
+        patch.object(DockerApp, "exists", new=AsyncMock(return_value=False)),
+        patch.object(DockerApp, "install", new=AsyncMock()) as install_mock,
+        patch.object(DockerApp, "cleanup", new=AsyncMock()),
+        patch.object(DockerApp, "import_image", new=AsyncMock()) as import_mock,
+    ):
+        assert await coresys.backups.do_restore_partial(backup, apps=["local_example"])
+
+    import_mock.assert_called_once()
+    install_mock.assert_not_called()
+
+
+@pytest.mark.usefixtures("supervisor_internet", "tmp_supervisor_data", "path_extern")
 async def test_restore_preserves_data_config(
     coresys: CoreSys, install_app_example: App
 ):
@@ -1713,7 +1753,7 @@ async def test_backup_to_mount_bypasses_free_space_condition(
 
 
 @pytest.mark.parametrize(
-    "partial_backup,exclude_db_setting",
+    ("partial_backup", "exclude_db_setting"),
     [(False, True), (True, True), (False, False), (True, False)],
 )
 @pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
@@ -1813,7 +1853,7 @@ async def test_backup_remove_error(
 
 
 @pytest.mark.parametrize(
-    "error_path,healthy_expected",
+    ("error_path", "healthy_expected"),
     [(Path("/data/backup"), False), (Path("/data/mounts/backup_test"), True)],
 )
 @pytest.mark.usefixtures("path_extern", "mount_propagation")

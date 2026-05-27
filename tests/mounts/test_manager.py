@@ -1,8 +1,10 @@
 """Tests for mount manager."""
 
+import errno
 import json
 import os
 from pathlib import Path
+from unittest.mock import patch
 from unittest.util import unorderable_list_difference
 
 from dbus_fast import DBusError, ErrorType, Variant
@@ -59,7 +61,7 @@ async def fixture_mount(
     mount = Mount.from_dict(coresys, MEDIA_TEST_DATA)
     coresys.mounts._mounts = {"media_test": mount}  # pylint: disable=protected-access
     await coresys.mounts.load()
-    yield mount
+    return mount
 
 
 async def test_load(
@@ -119,10 +121,16 @@ async def test_load(
                 "mnt-data-supervisor-mounts-backup_test.mount",
                 "fail",
                 [
-                    ("Options", Variant("s", "noserverino,guest")),
+                    (
+                        "Options",
+                        Variant(
+                            "s", "noserverino,soft,echo_interval=10,retrans=0,guest"
+                        ),
+                    ),
                     ("Type", Variant("s", "cifs")),
                     ("Description", Variant("s", "Supervisor cifs mount: backup_test")),
                     ("What", Variant("s", "//backup.local/backups")),
+                    ("TimeoutUSec", Variant("t", 35000000)),
                 ],
                 [],
             ),
@@ -130,10 +138,11 @@ async def test_load(
                 "mnt-data-supervisor-mounts-media_test.mount",
                 "fail",
                 [
-                    ("Options", Variant("s", "soft,timeo=200")),
+                    ("Options", Variant("s", "softerr,timeo=100,retrans=2")),
                     ("Type", Variant("s", "nfs")),
                     ("Description", Variant("s", "Supervisor nfs mount: media_test")),
                     ("What", Variant("s", "media.local:/media")),
+                    ("TimeoutUSec", Variant("t", 35000000)),
                 ],
                 [],
             ),
@@ -147,6 +156,7 @@ async def test_load(
                         Variant("s", "Supervisor bind mount: bind_media_test"),
                     ),
                     ("What", Variant("s", "/mnt/data/supervisor/mounts/media_test")),
+                    ("TimeoutUSec", Variant("t", 35000000)),
                 ],
                 [],
             ),
@@ -198,10 +208,11 @@ async def test_load_share_mount(
             "mnt-data-supervisor-mounts-share_test.mount",
             "fail",
             [
-                ("Options", Variant("s", "soft,timeo=200")),
+                ("Options", Variant("s", "softerr,timeo=100,retrans=2")),
                 ("Type", Variant("s", "nfs")),
                 ("Description", Variant("s", "Supervisor nfs mount: share_test")),
                 ("What", Variant("s", "share.local:/share")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         ),
@@ -212,6 +223,7 @@ async def test_load_share_mount(
                 ("Options", Variant("s", "bind")),
                 ("Description", Variant("s", "Supervisor bind mount: bind_share_test")),
                 ("What", Variant("s", "/mnt/data/supervisor/mounts/share_test")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         ),
@@ -324,6 +336,7 @@ async def test_mount_failed_during_load(
                 Variant("s", "Supervisor bind mount: emergency_media_test"),
             ),
             ("What", Variant("s", "/mnt/data/supervisor/emergency/media_test")),
+            ("TimeoutUSec", Variant("t", 35000000)),
         ],
         [],
     )
@@ -412,20 +425,41 @@ async def test_update_mount(
     ]
 
 
-async def test_reload_mount(
+async def test_reload_mount_healthy_skips_systemd(
     coresys: CoreSys,
     all_dbus_services: dict[str, DBusServiceMock],
     mount: Mount,
 ):
-    """Test reloading a mount."""
+    """A healthy mount (active + probe passes) skips the systemd reload."""
     systemd_service: SystemdService = all_dbus_services["systemd"]
     systemd_service.ReloadOrRestartUnit.calls.clear()
 
-    # Reload the mount
-    systemd_service.response_get_unit = [
-        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount"
-    ]
     await coresys.mounts.reload_mount(mount.name)
+
+    assert systemd_service.ReloadOrRestartUnit.calls == []
+
+
+async def test_reload_mount_probe_failure_triggers_systemd_reload(
+    coresys: CoreSys,
+    all_dbus_services: dict[str, DBusServiceMock],
+    mount: Mount,
+):
+    """A failed probe drives the systemd reload."""
+    systemd_service: SystemdService = all_dbus_services["systemd"]
+    systemd_service.ReloadOrRestartUnit.calls.clear()
+
+    systemd_service.response_get_unit = [
+        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+        "/org/freedesktop/systemd1/unit/tmp_2dyellow_2emount",
+    ]
+    with (
+        patch(
+            "supervisor.mounts.mount._probe_network_mount",
+            side_effect=OSError(errno.EHOSTDOWN, "Host is down"),
+        ),
+        pytest.raises(MountActivationError),
+    ):
+        await coresys.mounts.reload_mount(mount.name)
 
     assert len(systemd_service.ReloadOrRestartUnit.calls) == 1
     assert (
@@ -634,10 +668,11 @@ async def test_reload_mounts_attempts_initial_mount(
             "mnt-data-supervisor-mounts-media_test.mount",
             "fail",
             [
-                ("Options", Variant("s", "soft,timeo=200")),
+                ("Options", Variant("s", "softerr,timeo=100,retrans=2")),
                 ("Type", Variant("s", "nfs")),
                 ("Description", Variant("s", "Supervisor nfs mount: media_test")),
                 ("What", Variant("s", "media.local:/media")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         ),
@@ -648,6 +683,7 @@ async def test_reload_mounts_attempts_initial_mount(
                 ("Options", Variant("s", "bind")),
                 ("Description", Variant("s", "Supervisor bind mount: bind_media_test")),
                 ("What", Variant("s", "/mnt/data/supervisor/mounts/media_test")),
+                ("TimeoutUSec", Variant("t", 35000000)),
             ],
             [],
         ),

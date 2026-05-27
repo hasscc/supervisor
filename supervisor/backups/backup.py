@@ -28,7 +28,7 @@ from securetar import (
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
-from ..addons.manager import App
+from ..apps.manager import App
 from ..const import (
     ATTR_ADDONS,
     ATTR_COMPRESSED,
@@ -268,7 +268,7 @@ class Backup(JobGroup):
         """Returns a copy of the data."""
         return deepcopy(self._data)
 
-    def __eq__(self, other: Any) -> bool:
+    def __eq__(self, other: object) -> bool:
         """Return true if backups have same metadata."""
         return isinstance(other, Backup) and self.slug == other.slug
 

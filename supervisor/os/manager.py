@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 from pathlib import Path, PurePath
-from typing import cast
 
 import aiohttp
 from awesomeversion import AwesomeVersion, AwesomeVersionException
@@ -58,8 +57,8 @@ class SlotStatus:
             device=PurePath(data["device"]),
             bundle_compatible=data.get("bundle.compatible"),
             sha256=data.get("sha256"),
-            size=cast(int | None, data.get("size")),
-            installed_count=cast(int | None, data.get("installed.count")),
+            size=data.get("size"),
+            installed_count=data.get("installed.count"),
             bundle_version=AwesomeVersion(data["bundle.version"])
             if "bundle.version" in data
             else None,
@@ -67,7 +66,7 @@ class SlotStatus:
             if "installed.timestamp" in data
             else None,
             status=data.get("status"),
-            activated_count=cast(int | None, data.get("activated.count")),
+            activated_count=data.get("activated.count"),
             activated_timestamp=datetime.fromisoformat(data["activated.timestamp"])
             if "activated.timestamp" in data
             else None,
@@ -149,12 +148,12 @@ class OSManager(CoreSysAttributes):
     def get_slot_name(self, boot_name: str) -> str:
         """Get slot name from boot name."""
         if not self._slots:
-            raise HassOSSlotNotFound()
+            raise HassOSSlotNotFound
 
         for name, status in self._slots.items():
             if status.bootname == boot_name:
                 return name
-        raise HassOSSlotNotFound()
+        raise HassOSSlotNotFound
 
     def _get_download_url(self, version: AwesomeVersion) -> str:
         raw_url = self.sys_updater.ota_url
@@ -174,10 +173,9 @@ class OSManager(CoreSysAttributes):
         else:
             update_os_name = "haos"
 
-        url = raw_url.format(
+        return raw_url.format(
             version=str(version), board=update_board, os_name=update_os_name
         )
-        return url
 
     async def _download_raucb(self, url: str, raucb: Path) -> None:
         """Download rauc bundle (OTA) from URL."""
@@ -230,13 +228,13 @@ class OSManager(CoreSysAttributes):
         """Load HassOS data."""
         try:
             if not self.sys_host.info.cpe:
-                raise NotImplementedError()
+                raise NotImplementedError
 
             cpe = CPE(self.sys_host.info.cpe)
             os_name = cpe.get_product()[0]
             if os_name not in ("hassos", "haos"):
                 self._board = BOARD_NAME_SUPERVISED.lower()
-                raise NotImplementedError()
+                raise NotImplementedError
         except NotImplementedError:
             _LOGGER.info("No Home Assistant Operating System found")
             return
@@ -314,7 +312,7 @@ class OSManager(CoreSysAttributes):
             raise HassOSUpdateError("Rauc communication error", _LOGGER.error) from err
 
         finally:
-            int_ota.unlink()
+            await self.sys_run_in_executor(int_ota.unlink)
 
         # Update success
         if 0 in completed:
@@ -330,7 +328,7 @@ class OSManager(CoreSysAttributes):
             "Home Assistant Operating System update failed with: %s",
             self.sys_dbus.rauc.last_error,
         )
-        raise HassOSUpdateError()
+        raise HassOSUpdateError
 
     @Job(name="os_manager_mark_healthy", conditions=[JobCondition.HAOS], internal=True)
     async def mark_healthy(self) -> None:

@@ -202,6 +202,10 @@ disable = [
   "use-list-literal",                  # C405
   "useless-object-inheritance",        # UP004
   "useless-return",                    # PLR1711
+  "no-else-break",                     # RET508
+  "no-else-continue",                  # RET507
+  "no-else-raise",                     # RET506
+  "no-else-return",                    # RET505
   # "no-self-use", # PLR6301  # Optional plugin, not enabled
 ]
 
@@ -222,6 +226,13 @@ overgeneral-exceptions = ["builtins.BaseException", "builtins.Exception"]
 
 [tool.pylint.DESIGN]
 max-positional-arguments = 10
+
+[tool.mypy]
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+enable_error_code = ["exhaustive-match", "possibly-undefined"]
+disable_error_code = ["import-not-found", "import-untyped"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -269,6 +280,11 @@ lint.select = [
   "PLE",     # pylint
   "PLR",     # pylint
   "PLW",     # pylint
+  "PT",      # flake8-pytest-style
+  "PTH",     # flake8-pathlib
+  "PYI",     # flake8-pyi
+  "RET",     # flake8-return
+  "RSE",     # flake8-raise
   "Q000",    # Double quotes found but single quotes preferred
   "RUF006",  # Store a reference to the return value of asyncio.create_task
   "S102",    # Use of exec detected
