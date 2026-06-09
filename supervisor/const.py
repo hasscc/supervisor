@@ -9,6 +9,7 @@ from sys import version_info as systemversion
 from typing import Any, NotRequired, Self, TypedDict
 
 from aiohttp import __version__ as aiohttpversion
+from aiohttp.web import RequestKey
 
 SUPERVISOR_VERSION = "9999.09.9.dev9999"
 SERVER_SOFTWARE = f"HomeAssistantSupervisor/{SUPERVISOR_VERSION} aiohttp/{aiohttpversion} Python/{systemversion[0]}.{systemversion[1]}"
@@ -27,6 +28,7 @@ URL_HASSIO_VERSION = "https://version.home-assistant.io/{channel}.json"
 SUPERVISOR_DATA = Path("/data")
 
 FILE_HASSIO_ADDONS = Path(SUPERVISOR_DATA, "addons.json")
+FILE_HASSIO_APPS = Path(SUPERVISOR_DATA, "apps.json")
 FILE_HASSIO_AUTH = Path(SUPERVISOR_DATA, "auth.json")
 FILE_HASSIO_BACKUPS = Path(SUPERVISOR_DATA, "backups.json")
 FILE_HASSIO_BOARD = Path(SUPERVISOR_DATA, "board.json")
@@ -104,7 +106,7 @@ ENV_SUPERVISOR_NAME = "SUPERVISOR_NAME"
 ENV_SUPERVISOR_SHARE = "SUPERVISOR_SHARE"
 ENV_SUPERVISOR_CPU_RT = "SUPERVISOR_CPU_RT"
 
-REQUEST_FROM = "HASSIO_FROM"
+REQUEST_FROM: RequestKey[Any] = RequestKey("HASSIO_FROM")
 
 ATTR_ACCESS_TOKEN = "access_token"
 ATTR_ACCESSPOINTS = "accesspoints"
@@ -142,6 +144,7 @@ ATTR_BACKUPS = "backups"
 ATTR_BACKUPS_EXCLUDE_DATABASE = "backups_exclude_database"
 ATTR_BLK_READ = "blk_read"
 ATTR_BLK_WRITE = "blk_write"
+ATTR_BLOCKED_REASON = "blocked_reason"
 ATTR_BOARD = "board"
 ATTR_BOOT = "boot"
 ATTR_BRANCH = "branch"
@@ -164,6 +167,7 @@ ATTR_CONTENT_TRUST = "content_trust"
 ATTR_COUNTRY = "country"
 ATTR_CPE = "cpe"
 ATTR_CPU_PERCENT = "cpu_percent"
+ATTR_CURRENT_VERSION = "current_version"
 ATTR_DATA = "data"
 ATTR_DATE = "date"
 ATTR_DAYS_UNTIL_STALE = "days_until_stale"
@@ -258,6 +262,7 @@ ATTR_KERNEL = "kernel"
 ATTR_KERNEL_MODULES = "kernel_modules"
 ATTR_LABELS = "labels"
 ATTR_LAST_BOOT = "last_boot"
+ATTR_LATEST_VERSION = "latest_version"
 ATTR_LEGACY = "legacy"
 ATTR_LLMNR = "llmnr"
 ATTR_LOCALS = "locals"
@@ -368,7 +373,9 @@ ATTR_UNHEALTHY = "unhealthy"
 ATTR_UNSAVED = "unsaved"
 ATTR_UNSUPPORTED = "unsupported"
 ATTR_UPDATE_AVAILABLE = "update_available"
+ATTR_UPDATE_BLOCKED = "update_blocked"
 ATTR_UPDATE_KEY = "update_key"
+ATTR_UPDATE_PENDING = "update_pending"
 ATTR_URL = "url"
 ATTR_USB = "usb"
 ATTR_USER = "user"

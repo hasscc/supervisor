@@ -3,7 +3,6 @@
 # ruff: noqa: T100
 import asyncio
 from collections.abc import Callable
-from importlib import import_module
 import logging
 import os
 import signal
@@ -62,6 +61,7 @@ async def initialize_coresys() -> CoreSys:
         _LOGGER.warning("Environment variable 'SUPERVISOR_DEV' is set")
         coresys.config.logging = LogLevel.DEBUG
         coresys.config.debug = True
+        coresys.config.detect_blocking_io = True
     else:
         coresys.config.modify_log_level()
 
@@ -102,7 +102,12 @@ async def initialize_coresys() -> CoreSys:
         init_sentry(coresys)
 
     # bootstrap config
-    initialize_system(coresys)
+    def _bootstrap_config() -> None:
+        """Bootstrap config."""
+        _migrate_legacy_paths(coresys)
+        initialize_system(coresys)
+
+    await coresys.run_in_executor(_bootstrap_config)
 
     if coresys.dev:
         coresys.updater.channel = UpdateChannel.DEV
@@ -111,6 +116,44 @@ async def initialize_coresys() -> CoreSys:
     logging.Formatter.converter = lambda *args: coresys.now().timetuple()
 
     return coresys
+
+
+def _migrate_legacy_paths(coresys: CoreSys) -> None:
+    """Rename legacy addon directories and config file to new app paths."""
+    config = coresys.config
+    supervisor = config.path_supervisor
+
+    # Migrate addons/{core,data,local,git} -> apps/{core,data,local,git}
+    apps_dir = supervisor / "apps"
+    migrations = [
+        (supervisor / "addons" / "core", config.path_apps_core),
+        (supervisor / "addons" / "data", config.path_apps_data),
+        (supervisor / "addons" / "local", config.path_apps_local),
+        (supervisor / "addons" / "git", config.path_apps_git),
+        (supervisor / "addon_configs", config.path_app_configs),
+    ]
+    needs_apps_dir = any(
+        old.is_dir() and not new.exists()
+        for old, new in migrations[:4]  # only the apps/ sub-dirs
+    )
+    if needs_apps_dir and not apps_dir.is_dir():
+        apps_dir.mkdir(parents=True)
+
+    for old, new in migrations:
+        if old.is_dir() and not new.exists():
+            _LOGGER.info("Migrating %s to %s", old, new)
+            old.rename(new)
+
+    # Opportunistic remove of the now-empty legacy addons directory.
+    # rmdir only succeeds if empty, so leftover files keep it around.
+    legacy_addons = supervisor / "addons"
+    try:
+        legacy_addons.rmdir()
+    except OSError:
+        _LOGGER.debug(
+            "Legacy addons directory '%s' not empty, leaving in place",
+            legacy_addons.as_posix(),
+        )
 
 
 def initialize_system(coresys: CoreSys) -> None:
@@ -320,11 +363,15 @@ async def supervisor_debugger(coresys: CoreSys) -> None:
     if not coresys.config.debug:
         return
 
-    debugpy = await coresys.run_in_executor(import_module, "debugpy")
+    def setup_debugger() -> None:
+        # pylint: disable-next=import-outside-toplevel
+        import debugpy  # noqa: PLC0415
 
-    _LOGGER.info("Initializing Supervisor debugger")
+        _LOGGER.info("Initializing Supervisor debugger")
 
-    debugpy.listen(("0.0.0.0", 33333))
-    if coresys.config.debug_block:
-        _LOGGER.info("Wait until debugger is attached")
-        debugpy.wait_for_client()
+        debugpy.listen(("0.0.0.0", 33333))
+        if coresys.config.debug_block:
+            _LOGGER.info("Wait until debugger is attached")
+            debugpy.wait_for_client()
+
+    await coresys.run_in_executor(setup_debugger)

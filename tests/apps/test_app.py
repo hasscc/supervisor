@@ -47,7 +47,7 @@ from supervisor.utils.dt import utcnow
 
 from .test_manager import BOOT_FAIL_ISSUE, BOOT_FAIL_SUGGESTIONS
 
-from tests.common import fire_bus_event, get_fixture_path, is_in_list
+from tests.common import fire_bus_event, force_app_state, get_fixture_path, is_in_list
 from tests.const import TEST_ADDON_SLUG
 
 
@@ -126,7 +126,10 @@ def test_options_merge(coresys: CoreSys, install_app_ssh: App) -> None:
 
 async def test_app_state_listener(coresys: CoreSys, install_app_ssh: App) -> None:
     """Test app is setting state from docker events."""
-    with patch.object(DockerApp, "attach"):
+    with (
+        patch.object(DockerApp, "attach"),
+        patch.object(DockerApp, "current_state", return_value=ContainerState.UNKNOWN),
+    ):
         await install_app_ssh.load()
 
     assert install_app_ssh.state == AppState.UNKNOWN
@@ -235,7 +238,10 @@ async def test_app_watchdog(coresys: CoreSys, install_app_ssh: App) -> None:
         current_state.return_value = ContainerState.FAILED
         with patch.object(DockerApp, "stop") as stop:
             await _fire_test_event(
-                coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.FAILED
+                coresys,
+                f"addon_{TEST_ADDON_SLUG}",
+                ContainerState.FAILED,
+                exit_code=1,
             )
             stop.assert_called_once_with(remove_container=True)
             restart.assert_not_called()
@@ -246,7 +252,10 @@ async def test_app_watchdog(coresys: CoreSys, install_app_ssh: App) -> None:
         # Do not process event if container state has changed since fired
         current_state.return_value = ContainerState.HEALTHY
         await _fire_test_event(
-            coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.FAILED
+            coresys,
+            f"addon_{TEST_ADDON_SLUG}",
+            ContainerState.FAILED,
+            exit_code=1,
         )
         restart.assert_not_called()
         start.assert_not_called()
@@ -282,7 +291,10 @@ async def test_watchdog_port_conflict_does_not_retry(
     ):
         caplog.clear()
         await _fire_test_event(
-            coresys, f"addon_{TEST_ADDON_SLUG}", ContainerState.FAILED
+            coresys,
+            f"addon_{TEST_ADDON_SLUG}",
+            ContainerState.FAILED,
+            exit_code=1,
         )
 
         start.assert_called_once()
@@ -451,6 +463,19 @@ async def test_listeners_removed_on_uninstall(
             listener
             not in coresys.bus._listeners[BusEvent.DOCKER_CONTAINER_STATE_CHANGE]
         )
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_load_settles_state_from_running_container(
+    install_app_ssh: App, container: DockerContainer
+) -> None:
+    """Test load derives the state from a running container, not the default."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    await install_app_ssh.load()
+    # State is settled synchronously from current_state(), so it reflects the
+    # running container immediately rather than the image-only STOPPED default.
+    assert install_app_ssh.state == AppState.STARTED
 
 
 @pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
@@ -861,7 +886,7 @@ async def test_local_example_install(coresys: CoreSys, tmp_supervisor_data: Path
     """Test install of an app."""
     coresys.hardware.disk.get_disk_free_space = lambda x: 5000
     assert not (
-        data_dir := tmp_supervisor_data / "addons" / "data" / "local_example"
+        data_dir := tmp_supervisor_data / "apps" / "data" / "local_example"
     ).exists()
 
     with patch.object(DockerApp, "install") as install:
@@ -937,7 +962,7 @@ async def test_local_example_start(tmp_supervisor_data: Path, install_app_exampl
     assert install_app_example.state == AppState.STOPPED
 
     assert not (
-        app_config_dir := tmp_supervisor_data / "addon_configs" / "local_example"
+        app_config_dir := tmp_supervisor_data / "app_configs" / "local_example"
     ).exists()
 
     await install_app_example.start()
@@ -1248,10 +1273,10 @@ async def test_app_state_dismisses_issue(
     suggestions: list[SuggestionType],
 ):
     """Test an app state change dismisses the issues."""
-    install_app_ssh.state = initial_state
+    force_app_state(install_app_ssh, initial_state)
     coresys.resolution.add_issue(issue, suggestions)
 
-    install_app_ssh.state = target_state
+    force_app_state(install_app_ssh, target_state)
     assert coresys.resolution.issues == []
     assert coresys.resolution.suggestions == []
 
@@ -1261,7 +1286,7 @@ async def test_app_disable_boot_dismisses_boot_fail(
 ):
     """Test a disabling boot dismisses the boot fail issue."""
     install_app_ssh.boot = AppBoot.AUTO
-    install_app_ssh.state = AppState.ERROR
+    force_app_state(install_app_ssh, AppState.ERROR)
     coresys.resolution.add_issue(
         BOOT_FAIL_ISSUE, [suggestion.type for suggestion in BOOT_FAIL_SUGGESTIONS]
     )
