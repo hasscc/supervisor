@@ -9,7 +9,7 @@ import logging
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
-from aiohttp import ClientPayloadError, ClientWebSocketResponse, WSCloseCode
+from aiohttp import ClientPayloadError, ClientWebSocketResponse, WSCloseCode, web
 from aiohttp.http_websocket import WSMessage, WSMsgType
 from aiohttp.test_utils import TestClient
 import pytest
@@ -180,11 +180,18 @@ async def test_proxy_large_message(
         install_app_ssh.supervisor_token
     )
 
-    # Test message over size limit of 4MB
-    await client.send_bytes(bytearray(1024 * 1024 * 4))
-    msg = await client.receive()
-    assert msg.type == WSMsgType.CLOSE
-    assert msg.data == WSCloseCode.MESSAGE_TOO_BIG
+    # Test message over size limit of 4MB. Since aiohttp 3.14.1 the server
+    # rejects the oversized frame from its header and resets the connection
+    # before the full payload is sent, so the send itself may raise in
+    # addition to the CLOSE frame. See aio-libs/aiohttp#12817.
+    try:
+        await client.send_bytes(bytearray(1024 * 1024 * 4))
+    except ConnectionError:
+        pass
+    else:
+        msg = await client.receive()
+        assert msg.type == WSMsgType.CLOSE
+        assert msg.data == WSCloseCode.MESSAGE_TOO_BIG
 
     assert ha_ws_server.closed
 
@@ -221,6 +228,32 @@ async def test_proxy_auth_abort_log(
         assert (
             "Unexpected message during authentication for WebSocket API" in caplog.text
         )
+
+
+async def test_websocket_transport_none(
+    coresys,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Test WebSocket connection with transport None is handled gracefully."""
+    # Get the API proxy instance from coresys
+    api_proxy = APIProxy.__new__(APIProxy)
+    api_proxy.coresys = coresys
+
+    # Create a mock request with transport set to None to simulate connection loss
+    mock_request = AsyncMock(spec=web.Request)
+    mock_request.transport = None
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # This should raise HTTPBadRequest, not AssertionError
+        with pytest.raises(web.HTTPBadRequest) as exc_info:
+            await api_proxy.websocket(mock_request)
+
+        # Verify the error reason
+        assert exc_info.value.reason == "Connection closed"
+
+        # Verify the warning was logged
+        assert "WebSocket connection lost before upgrade" in caplog.text
 
 
 @pytest.mark.parametrize("path", ["", "mock_path"])

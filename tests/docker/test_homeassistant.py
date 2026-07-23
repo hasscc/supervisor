@@ -7,7 +7,6 @@ from aiodocker.containers import DockerContainer
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.const import FeatureFlag
 from supervisor.coresys import CoreSys
 from supervisor.docker.const import (
     MOUNT_CORE_RUN,
@@ -152,7 +151,6 @@ async def test_homeassistant_start_with_unix_socket(
 ):
     """Test starting homeassistant with unix socket env var for supported version."""
     coresys.homeassistant.version = AwesomeVersion("2026.4.0")
-    coresys.config.set_feature_flag(FeatureFlag.UNIX_SOCKET_CORE_API, True)
 
     with (
         patch.object(DockerAPI, "run", return_value=container.show.return_value) as run,
@@ -227,6 +225,36 @@ async def test_landingpage_start(coresys: CoreSys, container: DockerContainer):
             ),
         ]
         assert "volumes" not in run.call_args.kwargs
+
+
+async def test_version_landingpage_from_type_label(
+    coresys: CoreSys, container: DockerContainer
+):
+    """Test landingpage image resolves to LANDINGPAGE despite a real version label."""
+    container.show.return_value["Config"] = {
+        "Labels": {
+            "io.hass.type": "landingpage",
+            "io.hass.version": "2026.06.3",
+        }
+    }
+    await coresys.homeassistant.core.instance.attach(AwesomeVersion("2026.06.3"))
+
+    assert coresys.homeassistant.core.instance.version == LANDINGPAGE
+
+
+async def test_version_core_from_version_label(
+    coresys: CoreSys, container: DockerContainer
+):
+    """Test non-landingpage image resolves to the io.hass.version label value."""
+    container.show.return_value["Config"] = {
+        "Labels": {
+            "io.hass.type": "homeassistant",
+            "io.hass.version": "2026.06.3",
+        }
+    }
+    await coresys.homeassistant.core.instance.attach(AwesomeVersion("2026.06.3"))
+
+    assert coresys.homeassistant.core.instance.version == AwesomeVersion("2026.06.3")
 
 
 async def test_timeout(coresys: CoreSys, container: DockerContainer):

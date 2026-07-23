@@ -359,6 +359,11 @@ class AppModel(JobGroup, ABC):
         return [Path(node) for node in self.data.get(ATTR_DEVICES, [])]
 
     @property
+    def option_device_paths(self) -> set[Path]:
+        """Return raw device paths configured in options without full validation."""
+        return self.schema.extract_device_paths(self.options)
+
+    @property
     def environment(self) -> dict[str, str] | None:
         """Return environment of app."""
         return self.data.get(ATTR_ENVIRONMENT)
@@ -672,6 +677,9 @@ class AppModel(JobGroup, ABC):
 
     async def long_description(self) -> str | None:
         """Return README.md as long_description."""
+        # A detached app has no store source to read the README from.
+        if self.is_detached:
+            return None
 
         def read_readme() -> str | None:
             readme = Path(self.path_location, "README.md")

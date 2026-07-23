@@ -171,8 +171,39 @@ class HomeAssistantError(HassioError):
     """Home Assistant exception."""
 
 
-class HomeAssistantUpdateError(HomeAssistantError):
+class HomeAssistantUpdateError(HomeAssistantError, APIError):
     """Error on update of a Home Assistant."""
+
+    error_key = "homeassistant_update_error"
+    message_template = "Updating Home Assistant failed"
+
+
+class HomeAssistantUpdateImageError(HomeAssistantUpdateError):
+    """Raise when the Home Assistant image cannot be downloaded during update."""
+
+    error_key = "homeassistant_update_image_error"
+    message_template = "Downloading Home Assistant version {version} failed"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, version: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"version": version}
+        super().__init__(None, logger)
+
+
+class HomeAssistantUpdateAlreadyInstalledError(HomeAssistantUpdateError):
+    """Raise when the requested Home Assistant version is already installed."""
+
+    error_key = "homeassistant_update_already_installed_error"
+    message_template = "Home Assistant version {version} is already installed"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, version: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"version": version}
+        super().__init__(None, logger)
 
 
 class HomeAssistantCrashError(HomeAssistantError):
@@ -757,7 +788,7 @@ class HostError(HassioError):
 
 
 class HostNotSupportedError(HassioNotSupportedError):
-    """Host function is not supprted."""
+    """Host function is not supported."""
 
 
 class HostServiceError(HostError):
@@ -1142,7 +1173,7 @@ class PulseAudioError(HassioError):
 
 
 class ResolutionError(HassioError):
-    """Raise if an error is happning on resoltuion."""
+    """Raise if an error is happening on resolution."""
 
 
 class ResolutionCheckError(ResolutionError):
@@ -1154,7 +1185,7 @@ class ResolutionNotFound(ResolutionError):
 
 
 class ResolutionFixupError(HassioError):
-    """Rasie if a fixup fails."""
+    """Raise if a fixup fails."""
 
 
 class ResolutionFixupJobError(ResolutionFixupError, JobException):
@@ -1381,8 +1412,14 @@ class SecurityJobError(SecurityError, JobException):
 # Mount
 
 
-class MountError(HassioError):
-    """Raise on an error related to mounting/unmounting."""
+class MountError(APIError):
+    """Raise on an error related to mounting/unmounting.
+
+    Mount failures generally reflect user configuration or host conditions
+    (unreachable server, wrong credentials, ...) rather than a Supervisor bug.
+    Modeling them as APIError keeps them out of the unexpected-error path that
+    logs a traceback and reports to Sentry.
+    """
 
 
 class MountActivationError(MountError):
@@ -1393,7 +1430,7 @@ class MountInvalidError(MountError):
     """Raise on invalid mount attempt."""
 
 
-class MountNotFound(MountError):
+class MountNotFound(MountError, APINotFound):
     """Raise on mount not found."""
 
 

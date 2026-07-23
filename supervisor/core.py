@@ -180,7 +180,7 @@ class Core(CoreSysAttributes):
             self.sys_discovery.load(),
             # Load ingress
             self.sys_ingress.load(),
-            # Load Resoulution
+            # Load Resolution
             self.sys_resolution.load(),
         ]
 
@@ -272,7 +272,7 @@ class Core(CoreSysAttributes):
                 try:
                     await self.sys_homeassistant.core.start()
                 except HomeAssistantCrashError as err:
-                    _LOGGER.error("Can't start Home Assistant Core - rebuiling")
+                    _LOGGER.error("Can't start Home Assistant Core - rebuilding")
                     await async_capture_exception(err)
 
                     with suppress(HomeAssistantError):
@@ -304,7 +304,7 @@ class Core(CoreSysAttributes):
             if self.sys_homeassistant.version == LANDINGPAGE:
                 self.sys_create_task(self.sys_homeassistant.core.install())
 
-            # Upate Host/Deivce information
+            # Update Host/Device information
             self.sys_create_task(self.sys_host.reload())
             self.sys_create_task(self.sys_resolution.healthcheck())
 
