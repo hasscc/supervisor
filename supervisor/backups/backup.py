@@ -728,8 +728,10 @@ class Backup(JobGroup):
     async def remove_delta_apps(self) -> bool:
         """Remove apps which are not in this backup."""
         success = True
+        # Resolve the backup's app slugs once for fast membership checks
+        backup_app_slugs = set(self.app_list)
         for app in self.sys_apps.installed:
-            if app.slug in self.app_list:
+            if app.slug in backup_app_slugs:
                 continue
 
             # Remove App because it's not a part of the new env
@@ -766,18 +768,18 @@ class Backup(JobGroup):
             # Take backup
             _LOGGER.info("Backing up folder %s", name)
 
+            # Bind mounts are constant during the backup, so resolve the set of
+            # paths to skip once instead of per file.
+            excluded_paths = {
+                bound.bind_mount.local_where for bound in self.sys_mounts.bound_mounts
+            }
+
             def is_excluded_by_filter(item_arcpath: PurePath) -> bool:
                 """Filter out bind mounts in folders being backed up."""
                 full_path = origin_dir / item_arcpath.relative_to(".")
 
-                for bound in self.sys_mounts.bound_mounts:
-                    if full_path != bound.bind_mount.local_where:
-                        continue
-                    _LOGGER.debug(
-                        "Ignoring %s because of %s",
-                        full_path,
-                        bound.bind_mount.local_where.as_posix(),
-                    )
+                if full_path in excluded_paths:
+                    _LOGGER.debug("Ignoring %s because of bind mount", full_path)
                     return True
 
                 return False

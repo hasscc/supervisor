@@ -8,7 +8,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock, patch
 
 import aiodocker
-import attr
 import pytest
 
 from supervisor.apps import validate as vd
@@ -26,7 +25,7 @@ from supervisor.docker.const import (
     PropagationMode,
 )
 from supervisor.docker.manager import DockerAPI
-from supervisor.exceptions import CoreDNSError, DockerNotFound
+from supervisor.exceptions import CoreDNSError, DockerNotFound, DockerTimeoutError
 from supervisor.hardware.data import Device
 from supervisor.host.const import HostFeature
 from supervisor.os.manager import OSManager
@@ -191,6 +190,66 @@ def test_app_map_app_configs_folder(
 
 
 @pytest.mark.usefixtures("path_extern")
+@pytest.mark.parametrize(
+    ("mapping", "target"),
+    [
+        ("all_addon_configs", "/addon_configs"),
+        ("all_app_configs", "/app_configs"),
+    ],
+)
+def test_app_map_all_configs_folder_targets(
+    coresys: CoreSys,
+    addonsdata_system: dict[str, Data],
+    mapping: str,
+    target: str,
+):
+    """Test app/all-app configs mappings resolve to expected default targets."""
+    config = load_json_fixture("app-config-map-app_config.json")
+    config["map"].append(mapping)
+    docker_app = get_docker_app(coresys, addonsdata_system, config)
+
+    assert (
+        DockerMount(
+            type=MountType.BIND,
+            source=coresys.config.path_extern_app_configs.as_posix(),
+            target=target,
+            read_only=True,
+        )
+        in docker_app.mounts
+    )
+
+
+@pytest.mark.usefixtures("path_extern")
+@pytest.mark.parametrize(
+    ("mapping", "target"),
+    [
+        ("addons", "/addons"),
+        ("local_apps", "/local_apps"),
+    ],
+)
+def test_app_map_apps_folder_targets(
+    coresys: CoreSys,
+    addonsdata_system: dict[str, Data],
+    mapping: str,
+    target: str,
+):
+    """Test apps/addons mappings resolve to expected default targets."""
+    config = load_json_fixture("app-config-map-app_config.json")
+    config["map"].append(mapping)
+    docker_app = get_docker_app(coresys, addonsdata_system, config)
+
+    assert (
+        DockerMount(
+            type=MountType.BIND,
+            source=coresys.config.path_extern_apps_local.as_posix(),
+            target=target,
+            read_only=True,
+        )
+        in docker_app.mounts
+    )
+
+
+@pytest.mark.usefixtures("path_extern")
 def test_app_map_app_config_folder(
     coresys: CoreSys, addonsdata_system: dict[str, Data]
 ):
@@ -233,6 +292,87 @@ def test_app_map_app_config_folder_with_custom_target(
         )
         in docker_app.mounts
     )
+
+
+@pytest.mark.usefixtures("path_extern")
+def test_app_map_app_config_folder_with_custom_target_new_map_type(
+    coresys: CoreSys, addonsdata_system: dict[str, Data]
+):
+    """Test app_config map type uses app's public config folder with custom target."""
+    config = load_json_fixture("app-config-map-app_config.json")
+    config["map"].remove("addon_config")
+    config["map"].append(
+        {"type": "app_config", "read_only": False, "path": "/custom/target/path"}
+    )
+    docker_app = get_docker_app(coresys, addonsdata_system, config)
+
+    assert (
+        DockerMount(
+            type=MountType.BIND,
+            source=docker_app.app.path_extern_config.as_posix(),
+            target="/custom/target/path",
+            read_only=False,
+        )
+        in docker_app.mounts
+    )
+
+
+@pytest.mark.usefixtures("path_extern")
+@pytest.mark.parametrize(
+    ("app_mapping", "legacy_mapping", "source", "app_target", "legacy_target"),
+    [
+        (
+            "local_apps",
+            "addons",
+            "path_extern_apps_local",
+            "/local_apps/selected",
+            "/addons/ignored",
+        ),
+        (
+            "all_app_configs",
+            "all_addon_configs",
+            "path_extern_app_configs",
+            "/app_configs/selected",
+            "/addon_configs/ignored",
+        ),
+        (
+            "app_config",
+            "addon_config",
+            "path_extern_config",
+            "/app_config/selected",
+            "/addon_config/ignored",
+        ),
+    ],
+)
+def test_app_map_prefers_app_mapping_over_legacy_when_both_present(
+    coresys: CoreSys,
+    addonsdata_system: dict[str, Data],
+    app_mapping: str,
+    legacy_mapping: str,
+    source: str,
+    app_target: str,
+    legacy_target: str,
+):
+    """When both app and legacy map types are present, the legacy mount is ignored."""
+    config = load_json_fixture("basic-app-config.json")
+    config["map"] = [
+        {"type": legacy_mapping, "read_only": True, "path": legacy_target},
+        {"type": app_mapping, "read_only": False, "path": app_target},
+    ]
+    docker_app = get_docker_app(coresys, addonsdata_system, config)
+
+    assert (
+        DockerMount(
+            type=MountType.BIND,
+            source=getattr(coresys.config, source).as_posix()
+            if source != "path_extern_config"
+            else docker_app.app.path_extern_config.as_posix(),
+            target=app_target,
+            read_only=False,
+        )
+        in docker_app.mounts
+    )
+    assert legacy_target not in [mount.target for mount in docker_app.mounts]
 
 
 @pytest.mark.usefixtures("path_extern")
@@ -614,7 +754,7 @@ async def test_app_options_device_hw_listener(
     # Re-enumerated device: same by-id symlink, different kernel node and minor number.
     # When a USB device is unplugged and plugged back in, the kernel may assign a new
     # device node (ttyACM0 → ttyACM1) with a different minor number.
-    reenumerated_device = attr.evolve(
+    reenumerated_device = replace(
         TEST_HW_DEVICE,
         name="ttyACM1",
         path=Path("/dev/ttyACM1"),
@@ -707,3 +847,92 @@ async def test_app_options_device_policy_check(
 
         # Verify cgroup permission was NOT granted due to policy block
         add_devices.assert_not_called()
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_build_builder_cleanup_timeout(
+    coresys: CoreSys, addonsdata_system: dict[str, Data]
+):
+    """Test _build raises DockerTimeoutError when builder cleanup times out."""
+    docker_app = get_docker_app(coresys, addonsdata_system, "basic-app-config.json")
+
+    mock_build_env = MagicMock()
+    mock_build_env.is_valid = AsyncMock()
+    coresys.docker.containers.get.return_value.delete.side_effect = TimeoutError()
+
+    with (
+        patch(
+            "supervisor.docker.app.AppBuild.create",
+            AsyncMock(return_value=mock_build_env),
+        ),
+        pytest.raises(
+            DockerTimeoutError, match="Timeout cleaning up existing builder container"
+        ),
+    ):
+        await docker_app.install(docker_app.version, need_build=True)
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_build_inspect_timeout(
+    coresys: CoreSys, addonsdata_system: dict[str, Data]
+):
+    """Test _build raises DockerTimeoutError when image inspect times out after build."""
+    docker_app = get_docker_app(coresys, addonsdata_system, "basic-app-config.json")
+
+    mock_build_env = MagicMock()
+    mock_build_env.is_valid = AsyncMock()
+    mock_build_env.get_docker_config_json.return_value = None
+    mock_build_env.get_docker_args.return_value = {}
+
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        HTTPStatus.NOT_FOUND, {"message": "missing"}
+    )
+    coresys.docker.run_command = AsyncMock(return_value=MagicMock(exit_code=0, log=[]))
+    coresys.docker.images.inspect.side_effect = TimeoutError()
+
+    with (
+        patch(
+            "supervisor.docker.app.AppBuild.create",
+            AsyncMock(return_value=mock_build_env),
+        ),
+        pytest.raises(
+            DockerTimeoutError,
+            match="Timeout getting image metadata .* after build",
+        ),
+    ):
+        await docker_app.install(docker_app.version, need_build=True)
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_write_stdin_get_timeout(
+    coresys: CoreSys, addonsdata_system: dict[str, Data]
+):
+    """Test write_stdin raises DockerTimeoutError when containers.get times out."""
+    docker_app = get_docker_app(coresys, addonsdata_system, "basic-app-config.json")
+    coresys.docker.containers.get.side_effect = TimeoutError()
+
+    with pytest.raises(DockerTimeoutError, match="Timeout attaching to .* stdin"):
+        await docker_app.write_stdin(b"hello")
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_hardware_events_get_timeout(
+    coresys: CoreSys, addonsdata_system: dict[str, Data]
+):
+    """Test hardware event path raises DockerTimeoutError on container lookup timeout."""
+    docker_app = get_docker_app(coresys, addonsdata_system, "basic-app-config.json")
+    docker_app.app.data["devices"] = [TEST_DEV_PATH]
+
+    with patch.object(
+        type(coresys.host),
+        "features",
+        new=PropertyMock(return_value=[HostFeature.OS_AGENT]),
+    ):
+        with patch.object(App, "write_options"):
+            await docker_app.app.start()
+
+        coresys.docker.containers.get.side_effect = TimeoutError()
+        with pytest.raises(
+            DockerTimeoutError, match="Timeout processing Hardware Event"
+        ):
+            await fire_bus_event(coresys, BusEvent.HARDWARE_NEW_DEVICE, TEST_HW_DEVICE)

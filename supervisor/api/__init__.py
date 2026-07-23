@@ -612,8 +612,11 @@ class RestAPI(CoreSysAttributes):
 
             @api_process_raw(CONTENT_TYPE_TEXT, error_type=CONTENT_TYPE_TEXT)
             async def get_app_logs(request, *args, **kwargs):
-                addon = api_apps.get_app_for_request(request)
-                kwargs["identifier"] = f"addon_{addon.slug}"
+                app_obj = api_apps.get_app_for_request(request)
+                kwargs["identifier"] = [
+                    f"addon_{app_obj.slug}",
+                    f"app_{app_obj.slug}",
+                ]
                 return await self._api_host.advanced_logs(request, *args, **kwargs)
 
             # Legacy routing to support requests for not installed apps
@@ -625,7 +628,7 @@ class RestAPI(CoreSysAttributes):
                 """Route to store if info requested for not installed app."""
                 try:
                     addon: App = api_apps.get_app_for_request(request)
-                    return await api_apps.info_data(addon)
+                    return await api_apps.info_data(addon, request)
                 except APIAppNotInstalled:
                     # Route to store/{app}/info but add missing fields
                     return dict(
@@ -673,8 +676,11 @@ class RestAPI(CoreSysAttributes):
 
             @api_process_raw(CONTENT_TYPE_TEXT, error_type=CONTENT_TYPE_TEXT)
             async def get_app_logs_v2(request, *args, **kwargs):
-                addon = api_apps.get_app_for_request(request)
-                kwargs["identifier"] = f"addon_{addon.slug}"
+                app_obj = api_apps.get_app_for_request(request)
+                kwargs["identifier"] = [
+                    f"addon_{app_obj.slug}",
+                    f"app_{app_obj.slug}",
+                ]
                 return await self._api_host.advanced_logs(request, *args, **kwargs)
 
             app.add_routes(

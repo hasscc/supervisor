@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import PurePath
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import aiodocker
 from aiodocker.containers import DockerContainer
@@ -57,6 +57,55 @@ async def test_apps_info(
     assert result["data"]["watchdog"] is False
 
 
+@pytest.mark.parametrize("api_client", ["local_example"], indirect=True)
+async def test_apps_info_options_redacted_for_other_app(
+    api_client: TestClient,
+    install_app_ssh: App,
+    install_app_example: App,
+):
+    """Test a default-role app cannot read another app's options via info."""
+    install_app_example.data["hassio_role"] = "default"
+
+    # Request originates from local_example, reading local_ssh's info
+    resp = await api_client.get(f"/addons/{TEST_ADDON_SLUG}/info")
+    result = await resp.json()
+    # Non-secret metadata is still exposed...
+    assert result["data"]["slug"] == TEST_ADDON_SLUG
+    # ...but user options (which may hold secrets) are redacted
+    assert install_app_ssh.options != {}
+    assert result["data"]["options"] == {}
+
+
+@pytest.mark.parametrize("api_client", ["local_example"], indirect=True)
+async def test_apps_info_options_exposed_to_manager(
+    api_client: TestClient,
+    install_app_ssh: App,
+    install_app_example: App,
+):
+    """Test a manager-role app can read another app's options via info."""
+    install_app_example.data["hassio_role"] = "manager"
+
+    # Request originates from local_example (manager), reading local_ssh's info
+    resp = await api_client.get(f"/addons/{TEST_ADDON_SLUG}/info")
+    result = await resp.json()
+    assert install_app_ssh.options != {}
+    assert result["data"]["options"] == install_app_ssh.options
+
+
+@pytest.mark.parametrize("api_client", [TEST_ADDON_SLUG], indirect=True)
+async def test_apps_info_options_visible_for_self(
+    api_client: TestClient,
+    install_app_ssh: App,
+):
+    """Test a default-role app can always read its own options via info."""
+    install_app_ssh.data["hassio_role"] = "default"
+
+    resp = await api_client.get("/addons/self/info")
+    result = await resp.json()
+    assert install_app_ssh.options != {}
+    assert result["data"]["options"] == install_app_ssh.options
+
+
 # DEPRECATED - Remove with legacy routing logic on 1/2023
 async def test_apps_info_not_installed(
     api_client: TestClient, coresys: CoreSys, test_repository: Repository
@@ -78,11 +127,13 @@ async def test_apps_info_not_installed(
 
 @pytest.mark.usefixtures("install_app_ssh")
 async def test_api_app_logs(
-    advanced_logs_tester: Callable[[str, str], Awaitable[None]],
+    advanced_logs_tester: Callable[[str, str | list[str]], Awaitable[None]],
 ):
     """Test app logs."""
     await advanced_logs_tester(
-        "/addons/local_ssh", "addon_local_ssh", v2_path_prefix="/apps/local_ssh"
+        "/addons/local_ssh",
+        ["addon_local_ssh", "app_local_ssh"],
+        v2_path_prefix="/apps/local_ssh",
     )
 
 
@@ -94,6 +145,27 @@ async def test_api_app_logs_not_installed(api_client: TestClient):
     assert resp.content_type == "text/plain"
     content = await resp.text()
     assert content == "App hic_sunt_leones does not exist"
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_api_app_logs_latest_epoch_error(
+    api_client: TestClient, journald_logs: MagicMock
+):
+    """Test latest app logs returns sanitized error when epoch lookup fails."""
+    mock_response = MagicMock()
+    mock_response.text = AsyncMock(return_value="not-json")
+    journald_logs.return_value.__aenter__.return_value = mock_response
+
+    resp = await api_client.get("/addons/local_ssh/logs/latest")
+
+    assert resp.status == 500
+    assert resp.content_type == "text/plain"
+    content = await resp.text()
+    assert (
+        content
+        == "Cannot determine CONTAINER_LOG_EPOCH of addon_local_ssh, app_local_ssh. "
+        "Check Supervisor logs for details"
+    )
 
 
 @pytest.mark.usefixtures("docker_logs", "install_app_ssh")

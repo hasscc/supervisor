@@ -5,11 +5,11 @@ Code: https://github.com/home-assistant/plugin-dns
 
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass
 from ipaddress import IPv4Address
 import logging
 from pathlib import Path
 
-import attr
 from awesomeversion import AwesomeVersion
 import jinja2
 import voluptuous as vol
@@ -55,12 +55,12 @@ RESOLV_TMPL: Path = Path(__file__).parents[1].joinpath("data/resolv.tmpl")
 HOST_RESOLV: Path = Path("/etc/resolv.conf")
 
 
-@attr.s
+@dataclass(slots=True, frozen=True)
 class HostEntry:
     """Single entry in hosts."""
 
-    ip_address: IPv4Address = attr.ib()
-    names: list[str] = attr.ib()
+    ip_address: IPv4Address
+    names: list[str]
 
 
 class PluginDns(PluginBase):
@@ -332,8 +332,11 @@ class PluginDns(PluginBase):
         await self.save_data()
 
         # Resets hosts
-        with suppress(OSError):
-            self.hosts.unlink()
+        try:
+            await self.sys_run_in_executor(self.hosts.unlink)
+        except OSError as err:
+            self.sys_resolution.check_oserror(err)
+            _LOGGER.debug("Can't remove hosts file: %s", err)
         await self._init_hosts()
 
         # Reset loop protection

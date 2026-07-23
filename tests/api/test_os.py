@@ -7,10 +7,12 @@ from awesomeversion import AwesomeVersion
 from dbus_fast import DBusError, ErrorType
 import pytest
 
+from supervisor.const import CoreState
 from supervisor.coresys import CoreSys
 from supervisor.dbus.agent import OSAgent
 from supervisor.dbus.agent.boards import BoardManager
 from supervisor.dbus.agent.boards.interface import BoardProxy
+from supervisor.exceptions import DBusError as SupervisorDBusError
 from supervisor.host.control import SystemControl
 from supervisor.os.manager import OSManager
 from supervisor.resolution.const import ContextType, IssueType, SuggestionType
@@ -59,6 +61,7 @@ async def test_api_os_info(api_client_with_prefix: tuple[TestClient, str]):
     for attr in (
         "version",
         "version_latest",
+        "version_pending",
         "update_available",
         "board",
         "boot",
@@ -240,6 +243,96 @@ async def test_api_set_boot_slot_error(
     result = await resp.json()
     assert result["message"] == "Can't mark A as active!"
     capture_exception.assert_called_once()
+
+
+async def test_api_os_update_no_auto_reboot_creates_issue(
+    api_client_with_prefix: tuple[TestClient, str],
+    coresys: CoreSys,
+    tmp_supervisor_data,
+    path_extern: None,
+    supervisor_internet,
+    os_available,
+):
+    """Successful OS update does not auto-reboot and creates a reboot issue."""
+    api_client, prefix = api_client_with_prefix
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    async def fake_download(url, raucb) -> None:
+        raucb.touch()
+
+    with (
+        patch.object(
+            coresys.os,
+            "_get_download_url",
+            return_value="https://example.invalid/update.raucb",
+        ),
+        patch.object(coresys.os, "_download_raucb", side_effect=fake_download),
+        patch.object(coresys.host.control, "reboot") as reboot,
+    ):
+        resp = await api_client.post(f"{prefix}/os/update", json={"version": "13.0"})
+
+    assert resp.status == 200
+    reboot.assert_not_called()
+    assert (
+        Issue(IssueType.REBOOT_REQUIRED, ContextType.SYSTEM)
+        in coresys.resolution.issues
+    )
+    assert (
+        Suggestion(SuggestionType.EXECUTE_REBOOT, ContextType.SYSTEM)
+        in coresys.resolution.suggestions
+    )
+
+    resp = await api_client.get(f"{prefix}/os/info")
+    result = await resp.json()
+    assert result["data"]["version_pending"] == "13.0"
+    # Installed update is reported as current version so Core releases
+    # unaware of version_pending don't offer the update again
+    assert result["data"]["version"] == "13.0"
+
+
+async def test_api_os_update_failure_no_reboot_no_issue(
+    api_client_with_prefix: tuple[TestClient, str],
+    coresys: CoreSys,
+    tmp_supervisor_data,
+    path_extern: None,
+    supervisor_internet,
+    os_available,
+):
+    """Failed OS update does not auto-reboot and does not create reboot issue."""
+    api_client, prefix = api_client_with_prefix
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    async def fake_download(url, raucb) -> None:
+        raucb.touch()
+
+    with (
+        patch.object(
+            coresys.os,
+            "_get_download_url",
+            return_value="https://example.invalid/update.raucb",
+        ),
+        patch.object(coresys.os, "_download_raucb", side_effect=fake_download),
+        patch.object(
+            coresys.dbus.rauc,
+            "install",
+            side_effect=SupervisorDBusError("fail"),
+        ),
+        patch.object(coresys.host.control, "reboot") as reboot,
+    ):
+        resp = await api_client.post(f"{prefix}/os/update", json={"version": "13.0"})
+
+    assert resp.status == 400
+    result = await resp.json()
+    assert result["message"] == "Rauc communication error"
+    reboot.assert_not_called()
+    assert (
+        Issue(IssueType.REBOOT_REQUIRED, ContextType.SYSTEM)
+        not in coresys.resolution.issues
+    )
+    assert (
+        Suggestion(SuggestionType.EXECUTE_REBOOT, ContextType.SYSTEM)
+        not in coresys.resolution.suggestions
+    )
 
 
 async def test_api_board_yellow_info(

@@ -21,7 +21,7 @@ DNS_DOCKER_NAME: str = f"{DOCKER_PREFIX}_dns"
 OBSERVER_DOCKER_NAME: str = f"{DOCKER_PREFIX}_observer"
 SUPERVISOR_DOCKER_NAME: str = f"{DOCKER_PREFIX}_supervisor"
 
-URL_HASSIO_ADDONS = "https://github.com/home-assistant/addons"
+URL_HASSIO_APPS = "https://github.com/home-assistant/addons"
 URL_HASSIO_APPARMOR = "https://version.home-assistant.io/apparmor_{channel}.txt"
 URL_HASSIO_VERSION = "https://version.home-assistant.io/{channel}.json"
 
@@ -56,6 +56,10 @@ DOCKER_NETWORK_DRIVER = "bridge"
 DOCKER_IPV6_NETWORK_MASK = IPv6Network("fd0c:ac1e:2100::/48")
 DOCKER_IPV4_NETWORK_MASK = IPv4Network("172.30.32.0/23")
 DOCKER_IPV4_NETWORK_RANGE = IPv4Network("172.30.33.0/24")
+
+# Range used for dynamically assigned ingress ports (ingress_port: 0).
+INGRESS_DYNAMIC_PORT_MIN = 62000
+INGRESS_DYNAMIC_PORT_MAX = 65500
 
 # This needs to match the dockerd --cpu-rt-runtime= argument.
 DOCKER_CPU_RUNTIME_TOTAL = 950_000
@@ -387,6 +391,7 @@ ATTR_VALUE = "value"
 ATTR_VERSION = "version"
 ATTR_VERSION_TIMESTAMP = "version_timestamp"
 ATTR_VERSION_LATEST = "version_latest"
+ATTR_VERSION_PENDING = "version_pending"
 ATTR_VIDEO = "video"
 ATTR_VLAN = "vlan"
 ATTR_VOLUME = "volume"

@@ -95,6 +95,8 @@ from ..const import (
     ATTR_WATCHDOG,
     ATTR_WEBUI,
     REQUEST_FROM,
+    ROLE_ADMIN,
+    ROLE_MANAGER,
     AppBoot,
     AppBootConfig,
 )
@@ -221,8 +223,19 @@ class APIApps(CoreSysAttributes):
         """Reload all app data from store."""
         await asyncio.shield(self.sys_store.reload())
 
-    async def info_data(self, app: App) -> dict[str, Any]:
+    async def info_data(self, app: App, request: web.Request) -> dict[str, Any]:
         """Build and return app information dict (raises on invalid state)."""
+        # User options may contain secrets. Expose them only to trusted callers:
+        # Home Assistant Core (and other non-app internals), the app itself, or
+        # an app with the manager/admin role. Any other app reading a different
+        # app's info gets the options redacted.
+        request_from = request.get(REQUEST_FROM)
+        expose_options = (
+            not isinstance(request_from, App)
+            or request_from is app
+            or request_from.hassio_role in (ROLE_MANAGER, ROLE_ADMIN)
+        )
+
         return {
             ATTR_NAME: app.name,
             ATTR_SLUG: app.slug,
@@ -238,7 +251,7 @@ class APIApps(CoreSysAttributes):
             ATTR_RATING: rating_security(app),
             ATTR_BOOT_CONFIG: app.boot_config,
             ATTR_BOOT: app.boot,
-            ATTR_OPTIONS: app.options,
+            ATTR_OPTIONS: app.options if expose_options else {},
             ATTR_SCHEMA: app.schema_ui,
             ATTR_ARCH: app.supported_arch,
             ATTR_MACHINE: app.supported_machine,
@@ -303,7 +316,7 @@ class APIApps(CoreSysAttributes):
     async def info(self, request: web.Request) -> dict[str, Any]:
         """Return app information."""
         app: App = self.get_app_for_request(request)
-        return await self.info_data(app)
+        return await self.info_data(app, request)
 
     @api_process
     async def options(self, request: web.Request) -> None:
@@ -315,23 +328,25 @@ class APIApps(CoreSysAttributes):
 
         # Validate/Process Body
         body = await api_validate(SCHEMA_OPTIONS, request)
+        if body.get(ATTR_OPTIONS) is not None:
+            # Validate options
+            try:
+                body[ATTR_OPTIONS] = app.schema(body[ATTR_OPTIONS])
+            except vol.Invalid as ex:
+                raise AppConfigurationInvalidError(
+                    app=app.slug,
+                    validation_error=humanize_error(body[ATTR_OPTIONS], ex),
+                ) from None
+        if ATTR_BOOT in body and app.boot_config == AppBootConfig.MANUAL_ONLY:
+            raise AppBootConfigCannotChangeError(
+                app=app.slug, boot_config=app.boot_config.value
+            )
+
+        # Process options changes now that validation has passed
+        # This way we don't risk leaving the app in a half-configured state if validation fails
         if ATTR_OPTIONS in body:
-            # None resets options to defaults, otherwise validate the options
-            if body[ATTR_OPTIONS] is None:
-                app.options = None
-            else:
-                try:
-                    app.options = app.schema(body[ATTR_OPTIONS])
-                except vol.Invalid as ex:
-                    raise AppConfigurationInvalidError(
-                        app=app.slug,
-                        validation_error=humanize_error(body[ATTR_OPTIONS], ex),
-                    ) from None
+            app.options = body[ATTR_OPTIONS]
         if ATTR_BOOT in body:
-            if app.boot_config == AppBootConfig.MANUAL_ONLY:
-                raise AppBootConfigCannotChangeError(
-                    app=app.slug, boot_config=app.boot_config.value
-                )
             app.boot = body[ATTR_BOOT]
         if ATTR_AUTO_UPDATE in body:
             app.auto_update = body[ATTR_AUTO_UPDATE]

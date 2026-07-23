@@ -295,10 +295,16 @@ class BackupManager(FileConfiguration, JobGroup):
             if location == DEFAULT
             else {location_name: self.backup_locations[location_name]}
         )
+        # List the backup files of all locations in parallel; a slow or
+        # network-backed location should not hold up the others.
+        location_items = list(locations.items())
+        location_files = await asyncio.gather(
+            *(self._list_backup_files(path) for _, path in location_items)
+        )
         tasks = [
             self.sys_create_task(_load_backup(_location, tar_file))
-            for _location, path in locations.items()
-            for tar_file in await self._list_backup_files(path)
+            for (_location, _), tar_files in zip(location_items, location_files)
+            for tar_file in tar_files
         ]
 
         _LOGGER.info("Found %d backup files", len(tasks))
@@ -359,7 +365,7 @@ class BackupManager(FileConfiguration, JobGroup):
                     _LOGGER.error,
                 ) from err
             except OSError as err:
-                msg = f"Could delete backup at {backup_tarfile.as_posix()}: {err!s}"
+                msg = f"Cannot delete backup at {backup_tarfile.as_posix()}: {err!s}"
                 if location in {None, LOCATION_CLOUD_BACKUP}:
                     self.sys_resolution.check_oserror(err)
                 raise BackupError(msg, _LOGGER.error) from err
@@ -468,7 +474,12 @@ class BackupManager(FileConfiguration, JobGroup):
         )
         if not await backup.load():
             # Remove invalid backup from location it was moved to
-            await self.sys_run_in_executor(backup.tarfile.unlink)
+            try:
+                await self.sys_run_in_executor(backup.tarfile.unlink)
+            except OSError as err:
+                if location in {LOCATION_CLOUD_BACKUP, None}:
+                    self.sys_resolution.check_oserror(err)
+                _LOGGER.error("Can't remove invalid backup file: %s", err)
             return None
         _LOGGER.info("Successfully imported %s", backup.slug)
 
@@ -481,7 +492,12 @@ class BackupManager(FileConfiguration, JobGroup):
             try:
                 self._backups[backup.slug].consolidate(backup)
             except BackupInvalidError as err:
-                backup.tarfile.unlink()
+                try:
+                    await self.sys_run_in_executor(backup.tarfile.unlink)
+                except OSError as unlink_err:
+                    if location in {LOCATION_CLOUD_BACKUP, None}:
+                        self.sys_resolution.check_oserror(unlink_err)
+                    _LOGGER.error("Can't remove invalid backup file: %s", unlink_err)
                 raise BackupInvalidError(
                     f"Cannot import backup {backup.slug} due to: {err!s}", _LOGGER.error
                 ) from err
@@ -864,7 +880,7 @@ class BackupManager(FileConfiguration, JobGroup):
 
         try:
             # Stop Home-Assistant / Apps
-            await self.sys_core.shutdown(remove_homeassistant_container=True)
+            await self.sys_core.teardown_services(remove_homeassistant_container=True)
 
             success = await self._do_restore(
                 backup,
@@ -970,7 +986,7 @@ class BackupManager(FileConfiguration, JobGroup):
             *[app.is_running() for app in installed]
         )
         running_apps = [
-            installed[ind] for ind in range(len(installed)) if is_running[ind]
+            app for app, running in zip(installed, is_running, strict=True) if running
         ]
 
         # Create thaw task first to ensure we eventually undo freezes even if the below fails

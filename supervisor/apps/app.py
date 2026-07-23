@@ -14,7 +14,7 @@ import secrets
 import shutil
 import tarfile
 from tempfile import TemporaryDirectory
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 
 import aiohttp
 from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
@@ -135,7 +135,7 @@ _OPTIONS_MERGER: Final = Merger(
 
 # Backups just need to know if an app was running or not
 # Map other app states to those two
-_MAP_ADDON_STATE = {
+_MAP_APP_STATE = {
     AppState.STARTUP: AppState.STARTED,
     AppState.ERROR: AppState.STOPPED,
     AppState.UNKNOWN: AppState.STOPPED,
@@ -238,19 +238,24 @@ class App(AppModel):
         if new_state == AppState.STARTED or old_state == AppState.STARTUP:
             self._startup_event.set()
 
-        # Dismiss boot failed issue if present and we started
-        if new_state == AppState.STARTED and (
-            issue := self.sys_resolution.get_issue_if_present(self.boot_failed_issue)
-        ):
-            self.sys_resolution.dismiss_issue(issue)
+        # Dismiss boot failed or port conflict issue if present and we started
+        if new_state == AppState.STARTED:
+            for issue in self.sys_resolution.issues:
+                if (
+                    issue == self.boot_failed_issue
+                    or issue.type == IssueType.APP_PORT_CONFLICT
+                    and issue.context == ContextType.ADDON
+                    and issue.reference == self.slug
+                ):
+                    self.sys_resolution.dismiss_issue(issue)
 
         # Dismiss device access missing issue if present and we stopped
         if new_state == AppState.STOPPED and (
-            issue := self.sys_resolution.get_issue_if_present(
+            access_issue := self.sys_resolution.get_issue_if_present(
                 self.device_access_missing_issue
             )
         ):
-            self.sys_resolution.dismiss_issue(issue)
+            self.sys_resolution.dismiss_issue(access_issue)
 
         self.sys_homeassistant.websocket.supervisor_event_custom(
             WSEvent.ADDON,
@@ -737,7 +742,10 @@ class App(AppModel):
     @property
     def app_config_used(self) -> bool:
         """App is using its public config folder."""
-        return MappingType.ADDON_CONFIG in self.map_volumes
+        return (
+            MappingType.APP_CONFIG in self.map_volumes
+            or MappingType.ADDON_CONFIG in self.map_volumes
+        )
 
     @property
     def path_config(self) -> Path:
@@ -1227,6 +1235,29 @@ class App(AppModel):
             if self._wait_for_startup_task is asyncio.current_task():
                 self._wait_for_startup_task = None
 
+    def create_port_conflict_issue(
+        self, port: int, source: Literal["core"] | None = None
+    ) -> None:
+        """Create a port conflict issue for the given port.
+
+        Source can only be "core" or None currently, may be extended in future.
+        If problematic port is explicitly mapped by user, suggest clearing port
+        config as a potential fix. Else we just note the issue.
+        """
+        ports = self.ports or {}
+        suggestions = (
+            [SuggestionType.CLEAR_PORT_CONFIG]
+            if any(public_port == port for public_port in ports.values())
+            else None
+        )
+        self.sys_resolution.create_issue(
+            IssueType.APP_PORT_CONFLICT,
+            ContextType.ADDON,
+            reference=self.slug,
+            reference_extra={"port": port},
+            suggestions=suggestions,
+        )
+
     @Job(
         name="addon_start",
         on_condition=AppsJobError,
@@ -1275,11 +1306,9 @@ class App(AppModel):
         try:
             await self.instance.run()
         except DockerContainerPortConflict as err:
-            raise AppPortConflict(
-                _LOGGER.error,
-                name=self.slug,
-                port=cast(dict[str, Any], err.extra_fields)["port"],
-            ) from err
+            port = cast(dict[str, Any], err.extra_fields)["port"]
+            self.create_port_conflict_issue(port)
+            raise AppPortConflict(_LOGGER.error, name=self.slug, port=port) from err
         except DockerError as err:
             _LOGGER.error("Could not start container for app %s: %s", self.slug, err)
             self._update_state(operation_error=True)
@@ -1507,7 +1536,7 @@ class App(AppModel):
             ATTR_USER: self.persist,
             ATTR_SYSTEM: self.data,
             ATTR_VERSION: self.version,
-            ATTR_STATE: _MAP_ADDON_STATE.get(self.state, self.state),
+            ATTR_STATE: _MAP_APP_STATE.get(self.state, self.state),
         }
         apparmor_profile = (
             self.slug if self.sys_host.apparmor.exists(self.slug) else None
