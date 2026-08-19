@@ -13,7 +13,9 @@ from ..exceptions import (
     StoreInvalidAppRepo,
     StoreJobError,
     StoreNotFound,
+    StoreRepositoryAlreadyAddedError,
 )
+from ..homeassistant.const import WSEvent
 from ..jobs.decorator import Job, JobCondition
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..utils.common import FileConfiguration
@@ -115,6 +117,13 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
             await self.data.update()
             await self._read_apps()
 
+            # Notify Home Assistant so add-on update entities pick up the newly
+            # loaded store data instead of waiting for the next scheduled poll.
+            self.sys_homeassistant.websocket.supervisor_event(
+                WSEvent.STORE_RELOADED,
+                {ATTR_REPOSITORIES: sorted(updated_repos)},
+            )
+
     @Job(
         name="store_manager_add_repository",
         conditions=[
@@ -139,7 +148,7 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
         repository = Repository.create(self.coresys, url)
 
         if repository.slug in self.repositories:
-            raise StoreError(f"Can't add {url}, already in the store", _LOGGER.error)
+            raise StoreRepositoryAlreadyAddedError(_LOGGER.error, url=url)
 
         # Load the repository
         try:
@@ -191,7 +200,13 @@ class StoreManager(CoreSysAttributes, FileConfiguration):
                         IssueType.CORRUPT_REPOSITORY,
                         ContextType.STORE,
                         reference=repository.slug,
-                        suggestions=[SuggestionType.EXECUTE_REMOVE],
+                        # A repository that validated before and now doesn't is
+                        # most likely a corrupt local copy. Offer a reset to
+                        # re-clone and self-heal, keeping removal as a fallback.
+                        suggestions=[
+                            SuggestionType.EXECUTE_RESET,
+                            SuggestionType.EXECUTE_REMOVE,
+                        ],
                     )
                 else:
                     await repository.remove()

@@ -199,12 +199,12 @@ async def test_api_app_start_healthcheck(
         await asyncio.sleep(0)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
         )
         state_changes.append(install_app_ssh.state)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
         )
 
     async def container_events_task(*args, **kwargs):
@@ -238,12 +238,12 @@ async def test_api_app_restart_healthcheck(
         await asyncio.sleep(0)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
         )
         state_changes.append(install_app_ssh.state)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
         )
 
     async def container_events_task(*args, **kwargs):
@@ -282,18 +282,18 @@ async def test_api_app_rebuild_healthcheck(
         nonlocal state_changes
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.STOPPED)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED)
         )
         state_changes.append(install_app_ssh.state)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
         )
         state_changes.append(install_app_ssh.state)
         await asyncio.sleep(0)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
         )
 
     async def container_events_task(*args, **kwargs):
@@ -353,18 +353,18 @@ async def test_api_app_rebuild_force(
         nonlocal state_changes
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.STOPPED)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED)
         )
         state_changes.append(install_app_ssh.state)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
         )
         state_changes.append(install_app_ssh.state)
         await asyncio.sleep(0)
 
         await install_app_ssh.container_state_changed(
-            _create_test_event(f"addon_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
+            _create_test_event(f"app_{TEST_ADDON_SLUG}", ContainerState.HEALTHY)
         )
 
     async def container_events_task(*args, **kwargs):
@@ -540,9 +540,9 @@ async def test_app_options_boot_mode_manual_only_invalid(
         body["message"]
         == "App local_example boot option is set to manual_only so it cannot be changed"
     )
-    assert body["error_key"] == "addon_boot_config_cannot_change_error"
+    assert body["error_key"] == "app_boot_config_cannot_change_error"
     assert body["extra_fields"] == {
-        "addon": "local_example",
+        "app": "local_example",
         "boot_config": "manual_only",
     }
 
@@ -665,12 +665,12 @@ async def test_app_set_options_error(api_client: TestClient):
     body = await resp.json()
     assert (
         body["message"]
-        == "App local_example has invalid options: not a valid value. Got {'message': True}"
+        == "App local_example has invalid options: expected str. Got {'message': True}"
     )
-    assert body["error_key"] == "addon_configuration_invalid_error"
+    assert body["error_key"] == "app_configuration_invalid_error"
     assert body["extra_fields"] == {
-        "addon": "local_example",
-        "validation_error": "not a valid value. Got {'message': True}",
+        "app": "local_example",
+        "validation_error": "expected str. Got {'message': True}",
     }
 
 
@@ -691,9 +691,9 @@ async def test_app_start_options_error(
             body["message"]
             == "An unknown error occurred with app local_example. Check Supervisor logs for details"
         )
-        assert body["error_key"] == "addon_unknown_error"
+        assert body["error_key"] == "app_unknown_error"
         assert body["extra_fields"] == {
-            "addon": "local_example",
+            "app": "local_example",
         }
         assert "App local_example can't write options" in caplog.text
 
@@ -707,9 +707,9 @@ async def test_app_start_options_error(
         body["message"]
         == "App local_example has invalid options: expected boolean. Got {'message': 'hello'}"
     )
-    assert body["error_key"] == "addon_configuration_invalid_error"
+    assert body["error_key"] == "app_configuration_invalid_error"
     assert body["extra_fields"] == {
-        "addon": "local_example",
+        "app": "local_example",
         "validation_error": "expected boolean. Got {'message': 'hello'}",
     }
     assert (
@@ -731,8 +731,8 @@ async def test_app_not_running_error(
     assert resp.status == 400
     body = await resp.json()
     assert body["message"] == "App local_example is not running"
-    assert body["error_key"] == "addon_not_running_error"
-    assert body["extra_fields"] == {"addon": "local_example"}
+    assert body["error_key"] == "app_not_running_error"
+    assert body["extra_fields"] == {"app": "local_example"}
 
 
 @pytest.mark.usefixtures("install_app_example")
@@ -745,8 +745,8 @@ async def test_app_write_stdin_not_supported_error(
     assert resp.status == 400
     body = await resp.json()
     assert body["message"] == "App local_example does not support writing to stdin"
-    assert body["error_key"] == "addon_not_supported_write_stdin_error"
-    assert body["extra_fields"] == {"addon": "local_example"}
+    assert body["error_key"] == "app_not_supported_write_stdin_error"
+    assert body["extra_fields"] == {"app": "local_example"}
 
 
 @pytest.mark.usefixtures("install_app_ssh")
@@ -775,9 +775,9 @@ async def test_app_rebuild_fails_error(api_client: TestClient, coresys: CoreSys)
         body["message"]
         == "An unknown error occurred while trying to build the image for app local_ssh. Check Supervisor logs for details"
     )
-    assert body["error_key"] == "addon_build_failed_unknown_error"
+    assert body["error_key"] == "app_build_failed_unknown_error"
     assert body["extra_fields"] == {
-        "addon": "local_ssh",
+        "app": "local_ssh",
     }
 
 

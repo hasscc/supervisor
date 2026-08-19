@@ -391,7 +391,7 @@ async def test_api_backup_restore_background(
     assert job["child_jobs"][1]["reference"] == backup_slug
 
     if backup_type == "full":
-        assert job["child_jobs"][2]["name"] == "backup_remove_delta_addons"
+        assert job["child_jobs"][2]["name"] == "backup_remove_delta_apps"
         assert job["child_jobs"][2]["reference"] == backup_slug
 
 
@@ -443,9 +443,9 @@ async def test_api_backup_errors(
     assert job["errors"] == []
     assert job["child_jobs"][0]["name"] == "backup_store_homeassistant"
     assert job["child_jobs"][0]["reference"] == slug
-    assert job["child_jobs"][1]["name"] == "backup_store_addons"
+    assert job["child_jobs"][1]["name"] == "backup_store_apps"
     assert job["child_jobs"][1]["reference"] == slug
-    assert job["child_jobs"][1]["child_jobs"][0]["name"] == "backup_addon_save"
+    assert job["child_jobs"][1]["child_jobs"][0]["name"] == "backup_app_save"
     assert job["child_jobs"][1]["child_jobs"][0]["reference"] == "local_ssh"
     assert job["child_jobs"][1]["child_jobs"][0]["errors"] == [
         {
@@ -1584,7 +1584,7 @@ async def test_pre_post_backup_command_error(
     job_id = body["data"]["job_id"]
     job: SupervisorJob | None = None
     for j in coresys.jobs.jobs:
-        if j.name == "backup_store_addons" and j.parent_id == job_id:
+        if j.name == "backup_store_apps" and j.parent_id == job_id:
             job = j
             break
 
@@ -1596,9 +1596,9 @@ async def test_pre_post_backup_command_error(
         "1. Please report this to the app developer. Enable debug "
         "logging to capture complete command output using ha supervisor options --logging debug"
     )
-    assert job.errors[0].error_key == "addon_pre_post_backup_command_returned_error"
+    assert job.errors[0].error_key == "app_pre_post_backup_command_returned_error"
     assert job.errors[0].extra_fields == {
-        "addon": "local_example",
+        "app": "local_example",
         "exit_code": 1,
         "debug_logging_command": "ha supervisor options --logging debug",
     }

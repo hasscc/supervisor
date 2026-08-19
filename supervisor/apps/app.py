@@ -591,8 +591,21 @@ class App(AppModel):
 
     @property
     def ports(self) -> dict[str, int | None] | None:
-        """Return ports of app."""
-        return self.persist.get(ATTR_NETWORK, super().ports)
+        """Return effective ports, merging user overrides over config defaults.
+
+        This keeps every config-declared port visible even when the user only
+        remapped a subset, so optional ports left unpublished (and ports newly
+        added by an app update) stay visible and keep applying their defaults.
+        """
+        config_ports = super().ports
+        if config_ports is None:
+            return self.persist.get(ATTR_NETWORK)
+
+        persisted = self.persist.get(ATTR_NETWORK, {})
+        return {
+            container_port: persisted.get(container_port, default_host_port)
+            for container_port, default_host_port in config_ports.items()
+        }
 
     @ports.setter
     def ports(self, value: dict[str, int | None] | None) -> None:
@@ -608,6 +621,14 @@ class App(AppModel):
                 new_ports[container_port] = host_port
 
         self.persist[ATTR_NETWORK] = new_ports
+
+    def user_ports(self) -> dict[str, int | None]:
+        """Return only the user's persisted port overrides.
+
+        Unlike ``ports`` this excludes config defaults the user never touched,
+        so callers persisting a change only write back real user overrides.
+        """
+        return dict(self.persist.get(ATTR_NETWORK) or {})
 
     @property
     def ingress_url(self) -> str | None:
@@ -863,7 +884,7 @@ class App(AppModel):
         _LOGGER.debug("App %s write options: %s", self.slug, options)
 
     @Job(
-        name="addon_unload",
+        name="app_unload",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -896,7 +917,7 @@ class App(AppModel):
             )
 
     @Job(
-        name="addon_install",
+        name="app_install",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -950,7 +971,7 @@ class App(AppModel):
             await self.sys_ingress.reload()
 
     @Job(
-        name="addon_uninstall",
+        name="app_uninstall",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1018,7 +1039,7 @@ class App(AppModel):
             await self.sys_ingress.reload()
 
     @Job(
-        name="addon_update",
+        name="app_update",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1078,7 +1099,7 @@ class App(AppModel):
         return out
 
     @Job(
-        name="addon_rebuild",
+        name="app_rebuild",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1241,15 +1262,15 @@ class App(AppModel):
         """Create a port conflict issue for the given port.
 
         Source can only be "core" or None currently, may be extended in future.
-        If problematic port is explicitly mapped by user, suggest clearing port
-        config as a potential fix. Else we just note the issue.
+        If problematic port is mapped for this app (by user override or config
+        default), suggest clearing the mapping and then starting the app again.
+        Otherwise suggest starting the app again.
         """
         ports = self.ports or {}
-        suggestions = (
-            [SuggestionType.CLEAR_PORT_CONFIG]
-            if any(public_port == port for public_port in ports.values())
-            else None
-        )
+        suggestions = [SuggestionType.EXECUTE_START]
+        if any(public_port == port for public_port in ports.values()):
+            suggestions.insert(0, SuggestionType.CLEAR_PORT_CONFIG)
+
         self.sys_resolution.create_issue(
             IssueType.APP_PORT_CONFLICT,
             ContextType.ADDON,
@@ -1259,7 +1280,7 @@ class App(AppModel):
         )
 
     @Job(
-        name="addon_start",
+        name="app_start",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1318,7 +1339,7 @@ class App(AppModel):
         return self._wait_for_startup_task
 
     @Job(
-        name="addon_stop",
+        name="app_stop",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1333,7 +1354,7 @@ class App(AppModel):
             raise AppUnknownError(app=self.slug) from err
 
     @Job(
-        name="addon_restart",
+        name="app_restart",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1367,7 +1388,7 @@ class App(AppModel):
             raise AppUnknownError(app=self.slug) from err
 
     @Job(
-        name="addon_write_stdin",
+        name="app_write_stdin",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1405,7 +1426,7 @@ class App(AppModel):
             raise AppUnknownError(app=self.slug) from err
 
     @Job(
-        name="addon_begin_backup",
+        name="app_begin_backup",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1427,7 +1448,7 @@ class App(AppModel):
         return True
 
     @Job(
-        name="addon_end_backup",
+        name="app_end_backup",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1465,7 +1486,7 @@ class App(AppModel):
         return False
 
     @Job(
-        name="addon_backup",
+        name="app_backup",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1578,7 +1599,7 @@ class App(AppModel):
         return wait_for_start
 
     @Job(
-        name="addon_restore",
+        name="app_restore",
         on_condition=AppsJobError,
         concurrency=JobConcurrency.GROUP_REJECT,
     )
@@ -1727,11 +1748,12 @@ class App(AppModel):
         return wait_for_start
 
     @Job(
-        name="addon_restart_after_problem",
+        name="app_restart_after_problem",
         throttle_period=WATCHDOG_THROTTLE_PERIOD,
         throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
         on_condition=AppsJobError,
         throttle=JobThrottle.GROUP_RATE_LIMIT,
+        internal=True,
     )
     async def _restart_after_problem(
         self, state: ContainerState, exit_code: int | None = None
