@@ -28,6 +28,7 @@ from ..const import (
     SYSTEMD_JOURNAL_VOLATILE,
     BusEvent,
     CpuArch,
+    FeatureFlag,
 )
 from ..coresys import CoreSys
 from ..exceptions import (
@@ -68,6 +69,7 @@ from .const import (
     PATH_PUBLIC_CONFIG,
     PATH_SHARE,
     PATH_SSL,
+    REDUCED_CAPABILITIES_DROP,
     Capabilities,
     DockerMount,
     MountBindOptions,
@@ -389,6 +391,23 @@ class DockerApp(DockerInterface):
         return None
 
     @property
+    def dropped_capabilities(self) -> list[Capabilities] | None:
+        """Generate capabilities to drop from the Docker default set."""
+        candidates: list[Capabilities] = []
+        # NET_RAW allows ARP and MAC spoofing on the shared internal network.
+        if self.sys_config.feature_flags.get(FeatureFlag.APP_DROP_NET_RAW, False):
+            candidates.append(Capabilities.NET_RAW)
+        if self.sys_config.feature_flags.get(
+            FeatureFlag.APP_REDUCED_CAPABILITIES, False
+        ):
+            candidates.extend(REDUCED_CAPABILITIES_DROP)
+
+        # Keep whatever the app explicitly asked for
+        requested = set(self.capabilities or [])
+        dropped = [cap for cap in candidates if cap not in requested]
+        return dropped or None
+
+    @property
     def ulimits(self) -> list[Ulimit] | None:
         """Generate ulimits for app."""
         limits: list[Ulimit] = []
@@ -697,6 +716,7 @@ class DockerApp(DockerInterface):
                 extra_hosts=self.network_mapping,
                 device_cgroup_rules=self.cgroups_rules,
                 cap_add=self.capabilities,
+                cap_drop=self.dropped_capabilities,
                 ulimits=self.ulimits,
                 cpu_rt_runtime=self.cpu_rt_runtime,
                 security_opt=self.security_opt,
@@ -964,24 +984,21 @@ class DockerApp(DockerInterface):
     )
     async def write_stdin(self, data: bytes) -> None:
         """Write to app stdin."""
-        try:
-            # Load needed docker objects
-            container = await self.sys_docker.containers.get(self.name)
-            socket = container.attach(stdin=True)
-        except TimeoutError as err:
-            raise DockerTimeoutError(
-                f"Timeout attaching to {self.name} stdin", _LOGGER.error
-            ) from err
-        except aiodocker.DockerError as err:
-            raise DockerError(
-                f"Can't attach to {self.name} stdin: {err!s}", _LOGGER.error
-            ) from err
+        # container() builds the handle from the name with no I/O; attach()
+        # below addresses it by name/id directly.
+        container = self.sys_docker.containers.container(self.name)
+        socket = container.attach(stdin=True)
 
         try:
             await socket.write_in(data + b"\n")
             await socket.close()
-        # Seems to raise very generic exceptions like RuntimeError or AssertionError
-        # So we catch all exceptions and re-raise them as DockerError
+        except TimeoutError as err:
+            raise DockerTimeoutError(
+                f"Timeout writing to {self.name} stdin", _LOGGER.error
+            ) from err
+        # Seems to also raise very generic exceptions like RuntimeError or
+        # AssertionError, so we catch all remaining exceptions and re-raise
+        # them as DockerError
         except Exception as err:
             raise DockerError(
                 f"Can't write to {self.name} stdin: {err!s}", _LOGGER.error

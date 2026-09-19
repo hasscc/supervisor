@@ -14,6 +14,17 @@ import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
 from ..const import (
+    ATTR_BLK_READ,
+    ATTR_BLK_WRITE,
+    ATTR_CPU_PERCENT,
+    ATTR_CPU_SYSTEM_USAGE,
+    ATTR_CPU_USAGE,
+    ATTR_MEMORY_LIMIT,
+    ATTR_MEMORY_PERCENT,
+    ATTR_MEMORY_USAGE,
+    ATTR_NETWORK_RX,
+    ATTR_NETWORK_TX,
+    ATTR_ONLINE_CPUS,
     HEADER_TOKEN,
     HEADER_TOKEN_OLD,
     JSON_DATA,
@@ -27,8 +38,16 @@ from ..const import (
     RESULT_OK,
 )
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import APIError, HassioError
+from ..docker.stats import DockerStats
+from ..exceptions import (
+    APIError,
+    APISystemNotReadyError,
+    HassioError,
+    JobConditionException,
+)
 from ..jobs import JobSchedulerOptions, SupervisorJob
+from ..jobs.const import JobCondition
+from ..jobs.decorator import Job
 from ..utils import get_message_from_exception_chain
 from ..utils.json import json_dumps, json_loads as json_loads_util
 from ..utils.sentry import async_capture_exception
@@ -99,6 +118,32 @@ def json_loads(data: Any) -> dict[str, Any]:
         raise APIError("Invalid json") from err
 
 
+def api_return_stats(stats: DockerStats, *, legacy: bool) -> dict[str, Any]:
+    """Return the standard API response dict for a DockerStats object.
+
+    ``legacy`` selects the v1-compatible response model, which includes
+    ``cpu_percent`` (a windowed calculation that is ``None`` for a one-shot
+    sample). V2 always requests one-shot stats, so that field is dropped
+    from its response since it would never carry a meaningful value.
+    """
+    data = {
+        ATTR_CPU_USAGE: stats.cpu_usage,
+        ATTR_CPU_SYSTEM_USAGE: stats.cpu_system_usage,
+        ATTR_ONLINE_CPUS: stats.online_cpus,
+        ATTR_MEMORY_USAGE: stats.memory_usage,
+        ATTR_MEMORY_LIMIT: stats.memory_limit,
+        ATTR_MEMORY_PERCENT: stats.memory_percent,
+        ATTR_NETWORK_RX: stats.network_rx,
+        ATTR_NETWORK_TX: stats.network_tx,
+        ATTR_BLK_READ: stats.blk_read,
+        ATTR_BLK_WRITE: stats.blk_write,
+    }
+    if legacy:
+        data[ATTR_CPU_PERCENT] = stats.cpu_percent
+
+    return data
+
+
 def api_process(method):
     """Wrap function with true/false calls to rest api."""
 
@@ -143,6 +188,41 @@ def require_home_assistant(method):
         request: Request = args[0]
         if request[REQUEST_FROM] != coresys.homeassistant:
             raise HTTPUnauthorized
+        return await method(api, *args, **kwargs)
+
+    return wrap_api
+
+
+def require_running_system(method):
+    """Reject the API call unless Supervisor has fully started and is not frozen.
+
+    Supervisor boots apps and Home Assistant Core in a specific order, and
+    replays a similarly ordered sequence while restoring a backup (during
+    which it is in the freeze state). Starting, restarting, rebuilding or
+    updating something via the API while one of those sequences is still in
+    progress risks running it out of order, or blocking a scheduled start
+    from that sequence outright via job concurrency (see #7189). This does
+    not affect the internal calls Supervisor itself makes as part of those
+    sequences, only ones coming from the API.
+
+    This uses Job.check_conditions() directly instead of the @Job(...)
+    decorator on purpose: @Job() creates and tracks a full SupervisorJob
+    (job history, concurrency/throttle handling, ...) for the call it wraps,
+    and requires the wrapped object to be a JobGroup to use group-level
+    concurrency. The API view classes here are a separate layer from the
+    CoreSysAttributes business-logic classes (App, HomeAssistantCore, ...)
+    that already have their own @Job-decorated methods with that tracking;
+    wrapping the API handler in a second @Job would just create a duplicate,
+    misleading job entry for the same logical operation. check_conditions()
+    runs only the condition check, with none of that overhead.
+    """
+
+    async def wrap_api(api: CoreSysAttributes, *args, **kwargs) -> Any:
+        """Check system state then return API information."""
+        try:
+            await Job.check_conditions(api, {JobCondition.RUNNING}, method.__qualname__)
+        except JobConditionException as err:
+            raise APISystemNotReadyError from err
         return await method(api, *args, **kwargs)
 
     return wrap_api

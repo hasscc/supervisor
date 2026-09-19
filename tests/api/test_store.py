@@ -33,6 +33,17 @@ from tests.const import TEST_ADDON_SLUG
 REPO_URL = "https://github.com/awesome-developer/awesome-repo"
 
 
+@pytest.fixture(autouse=True)
+async def running_state(coresys: CoreSys) -> None:
+    """Set the default state to a fully started system.
+
+    Updating an app via the API is only allowed once Supervisor has fully
+    started (see require_running_system). Tests exercising other states set
+    them explicitly.
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
+
+
 async def test_api_store(
     api_client: TestClient,
     store_app: AppStore,
@@ -97,8 +108,12 @@ async def test_api_store_repositories_repository(
     assert result["data"]["slug"] == test_repository.slug
 
 
+@pytest.mark.parametrize("repo_url", [REPO_URL, f"  {REPO_URL}  "])
 async def test_api_store_add_repository(
-    api_client: TestClient, coresys: CoreSys, supervisor_internet: AsyncMock
+    api_client: TestClient,
+    coresys: CoreSys,
+    supervisor_internet: AsyncMock,
+    repo_url: str,
 ) -> None:
     """Test POST /store/repositories REST API."""
     with (
@@ -106,7 +121,7 @@ async def test_api_store_add_repository(
         patch("supervisor.store.repository.RepositoryGit.validate", return_value=True),
     ):
         response = await api_client.post(
-            "/store/repositories", json={"repository": REPO_URL}
+            "/store/repositories", json={"repository": repo_url}
         )
 
     assert response.status == 200

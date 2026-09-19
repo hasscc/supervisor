@@ -37,6 +37,12 @@ from supervisor.supervisor import Supervisor
 
 from tests.common import AsyncIterator, load_json_fixture
 
+CORRUPT_CONTAINER_MESSAGE = (
+    "RWLayer of container "
+    "1b56493ca170514364e10113038a16e9d207cb16a229be55ed6139649a39ca4e "
+    "is unexpectedly nil"
+)
+
 
 @pytest.mark.parametrize(
     ("cpu_arch", "platform"),
@@ -214,7 +220,7 @@ async def test_current_state(
 
 async def test_current_state_failures(coresys: CoreSys):
     """Test failure states for current state."""
-    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+    coresys.docker.containers.get.return_value.show.side_effect = aiodocker.DockerError(
         404, {"message": "does not exist"}
     )
     assert (
@@ -222,16 +228,37 @@ async def test_current_state_failures(coresys: CoreSys):
         == ContainerState.UNKNOWN
     )
 
-    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+    coresys.docker.containers.get.return_value.show.side_effect = aiodocker.DockerError(
         500, {"message": "fail"}
     )
     with pytest.raises(DockerAPIError):
         await coresys.homeassistant.core.instance.current_state()
 
 
+async def test_corrupt_container_treated_as_missing(
+    coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test a container with corrupt storage metadata is reported as missing."""
+    coresys.docker.containers.get.return_value.show.side_effect = aiodocker.DockerError(
+        500, CORRUPT_CONTAINER_MESSAGE
+    )
+
+    assert (
+        await coresys.homeassistant.core.instance.current_state()
+        == ContainerState.UNKNOWN
+    )
+    assert not await coresys.homeassistant.core.instance.is_running()
+    assert "storage metadata is corrupt" in caplog.text
+
+    # Read path: reported missing, nothing is removed here
+    coresys.docker.containers.get.return_value.delete.assert_not_called()
+
+
 async def test_current_state_timeout(coresys: CoreSys):
     """Test timeout while reading container state raises DockerTimeoutError."""
-    coresys.docker.containers.get.side_effect = TimeoutError("timed out")
+    coresys.docker.containers.get.return_value.show.side_effect = TimeoutError(
+        "timed out"
+    )
 
     with pytest.raises(DockerTimeoutError, match="Timeout occurred"):
         await coresys.homeassistant.core.instance.current_state()
@@ -320,7 +347,7 @@ async def test_attach_existing_container(
 
 async def test_attach_container_failure(coresys: CoreSys):
     """Test attach fails to find container but finds image."""
-    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+    coresys.docker.containers.get.return_value.show.side_effect = aiodocker.DockerError(
         500, {"message": "fail"}
     )
     coresys.docker.images.inspect.return_value.setdefault("Config", {})["Image"] = (
@@ -340,7 +367,7 @@ async def test_attach_container_failure(coresys: CoreSys):
 
 async def test_attach_total_failure(coresys: CoreSys):
     """Test attach fails to find container or image."""
-    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+    coresys.docker.containers.get.return_value.show.side_effect = aiodocker.DockerError(
         500, {"message": "fail"}
     )
     coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
@@ -378,6 +405,27 @@ async def test_run_missing_image(
         await install_app_ssh.instance.run()
 
     capture_exception.assert_called_once()
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_run_recreates_corrupt_container(
+    coresys: CoreSys, install_app_ssh: App, container: DockerContainer
+):
+    """Test run removes and recreates a container with corrupt storage metadata."""
+    container.show.side_effect = aiodocker.DockerError(500, CORRUPT_CONTAINER_MESSAGE)
+
+    def delete_side_effect(**kwargs):
+        # Once the corrupt container record is removed, inspects of the
+        # recreated container succeed again
+        container.show.side_effect = None
+
+    container.delete.side_effect = delete_side_effect
+    install_app_ssh.data["image"] = "test_image"
+
+    await install_app_ssh.instance.run()
+
+    container.delete.assert_called_once_with(force=True, v=True)
+    coresys.docker.containers.create.assert_called_once()
 
 
 async def test_install_fires_progress_events(
@@ -1129,8 +1177,8 @@ async def test_install_unknown_registry_rate_limit_raises_generic_exception(
 
 
 async def test_attach_container_get_timeout_falls_through_to_image(coresys: CoreSys):
-    """Test attach suppresses TimeoutError from containers.get and falls through to image inspect."""
-    coresys.docker.containers.get.side_effect = TimeoutError()
+    """Test attach suppresses TimeoutError from show and falls through to image inspect."""
+    coresys.docker.containers.get.return_value.show.side_effect = TimeoutError()
     coresys.docker.images.inspect.return_value.setdefault("Config", {})["Image"] = (
         "sha256:abc123"
     )
@@ -1141,7 +1189,7 @@ async def test_attach_container_get_timeout_falls_through_to_image(coresys: Core
 
 async def test_attach_fallback_image_inspect_timeout(coresys: CoreSys):
     """Test attach raises DockerTimeoutError when fallback image inspect times out."""
-    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+    coresys.docker.containers.get.return_value.show.side_effect = aiodocker.DockerError(
         500, {"message": "fail"}
     )
     coresys.docker.images.inspect.side_effect = TimeoutError()
