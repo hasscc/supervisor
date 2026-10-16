@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from dataclasses import replace
 from http import HTTPStatus
 from ipaddress import IPv4Address
 import logging
@@ -223,7 +222,7 @@ class DockerApp(DockerInterface):
     @property
     def environment(self) -> dict[str, str | int | None]:
         """Return environment for Docker app."""
-        app_env = cast(dict[str, str | int | None], self.app.environment or {})
+        app_env = cast(dict[str, str | int | None], dict(self.app.environment or {}))
 
         # Provide options for legacy apps
         if self.app.legacy:
@@ -1078,7 +1077,7 @@ class DockerApp(DockerInterface):
             and not self.sys_os.available
         ):
             self.sys_resolution.add_issue(
-                replace(self.app.device_access_missing_issue),
+                self.app.device_access_missing_issue,
                 suggestions=[SuggestionType.EXECUTE_RESTART],
             )
             return

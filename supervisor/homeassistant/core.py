@@ -16,7 +16,7 @@ from awesomeversion import AwesomeVersion
 from supervisor.utils import remove_colors
 
 from ..bus import EventListener
-from ..const import ATTR_HOMEASSISTANT, BusEvent, CoreState
+from ..const import BusEvent, CoreState
 from ..coresys import CoreSys
 from ..docker.const import ContainerState
 from ..docker.homeassistant import HASS_DOCKER_NAME, DockerHomeAssistant
@@ -260,7 +260,7 @@ class HomeAssistantCore(JobGroup):
                     else:
                         _LOGGER.info("Home Assistant Core installation in progress")
 
-        progress_task = self.sys_create_task(_periodic_progress_log())
+        progress_task = self.sys_create_background_task(_periodic_progress_log())
         install_image = self.sys_homeassistant.install_image
         try:
             while True:
@@ -397,7 +397,6 @@ class HomeAssistantCore(JobGroup):
             await self.sys_backups.do_backup_partial(
                 name=f"core_{self.instance.version}",
                 homeassistant=True,
-                folders=[ATTR_HOMEASSISTANT],
             )
 
         # process an update

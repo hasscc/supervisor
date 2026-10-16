@@ -224,7 +224,11 @@ class MockResponse:
 
 
 class AsyncIterator:
-    """Make list/fixture into async iterator for test mocks."""
+    """Make list/fixture into async iterator for test mocks.
+
+    Exception instances in the sequence are raised when reached, e.g. to mimic
+    aiodocker raising DockerStreamError on an error chunk mid-stream.
+    """
 
     def __init__(self, seq: Sequence[Any]) -> None:
         """Initialize with sequence."""
@@ -237,9 +241,12 @@ class AsyncIterator:
     async def __anext__(self) -> Any:
         """Return next in sequence."""
         try:
-            return next(self.iter)
+            item = next(self.iter)
         except StopIteration:
             raise StopAsyncIteration from None
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 def mount_start_transient_unit_call(
@@ -251,6 +258,7 @@ def mount_start_transient_unit_call(
     what: str,
     fstype: str,
     options: str | None,
+    lazy_unmount: bool = True,
 ) -> tuple:
     """Build the expected StartTransientUnit call for a mount unit pair.
 
@@ -265,9 +273,10 @@ def mount_start_transient_unit_call(
         ("Description", Variant("s", description)),
         ("What", Variant("s", what)),
         ("TimeoutUSec", Variant("t", 35000000)),
-        ("LazyUnmount", Variant("b", True)),
-        ("StartLimitIntervalUSec", Variant("t", 0)),
     ]
+    if lazy_unmount:
+        mount_properties.append(("LazyUnmount", Variant("b", True)))
+    mount_properties.append(("StartLimitIntervalUSec", Variant("t", 0)))
     return (
         automount_unit,
         "fail",

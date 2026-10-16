@@ -6,9 +6,10 @@ import logging
 from typing import Any
 
 import aiohttp
-from aiohttp import ClientTimeout, hdrs, web
+from aiohttp import ClientTimeout, ClientWSTimeout, WSCloseCode, hdrs, web
 from aiohttp.web_exceptions import (
     HTTPBadGateway,
+    HTTPForbidden,
     HTTPServiceUnavailable,
     HTTPUnauthorized,
 )
@@ -29,13 +30,15 @@ from ..const import (
     HEADER_REMOTE_USER_NAME,
     HEADER_TOKEN,
     HEADER_TOKEN_OLD,
+    STOPPING_STATES,
+    WEBSOCKET_CLOSE_TIMEOUT,
     HomeAssistantUser,
     IngressSessionData,
 )
 from ..coresys import CoreSysAttributes
-from ..exceptions import HomeAssistantAPIError
-from .const import COOKIE_INGRESS
-from .utils import api_process, api_validate, require_home_assistant
+from ..exceptions import APIError, HomeAssistantAPIError
+from .const import COOKIE_INGRESS, WEBSOCKETS
+from .utils import api_process, api_validate, require_home_assistant, stop_on_disconnect
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -46,7 +49,7 @@ VALIDATE_SESSION_DATA = vol.Schema({ATTR_SESSION: str})
 """Expected optional payload of create session request"""
 SCHEMA_INGRESS_CREATE_SESSION_DATA = vol.Schema(
     {
-        vol.Optional(ATTR_SESSION_DATA_USER_ID): str,
+        vol.Required(ATTR_SESSION_DATA_USER_ID): str,
     }
 )
 
@@ -111,19 +114,21 @@ class APIIngress(CoreSysAttributes):
     @require_home_assistant
     async def create_session(self, request: web.Request) -> dict[str, Any]:
         """Create a new session."""
-        schema_ingress_config_session_data = await api_validate(
-            SCHEMA_INGRESS_CREATE_SESSION_DATA, request
-        )
-        data: IngressSessionData | None = None
+        body = await api_validate(SCHEMA_INGRESS_CREATE_SESSION_DATA, request)
+        user_id = body[ATTR_SESSION_DATA_USER_ID]
 
-        if ATTR_SESSION_DATA_USER_ID in schema_ingress_config_session_data:
-            user = await self._find_user_by_id(
-                schema_ingress_config_session_data[ATTR_SESSION_DATA_USER_ID]
-            )
-            if user:
-                data = IngressSessionData(user)
+        try:
+            user = await self._find_user_by_id(user_id)
+        except HomeAssistantAPIError as err:
+            _LOGGER.warning("Could not fetch list of users: %s", err)
+            # Keep the ID so the user can be resolved on first use
+            user = HomeAssistantUser(user_id)
+        else:
+            if user is None or not user.is_active:
+                raise APIError(f"User {user_id} does not exist or is inactive")
+            self.sys_ingress.users[user.id] = user
 
-        session = self.sys_ingress.create_session(data)
+        session = self.sys_ingress.create_session(IngressSessionData(user))
         return {ATTR_SESSION: session}
 
     @api_process
@@ -152,13 +157,21 @@ class APIIngress(CoreSysAttributes):
         app = self._extract_app(request)
         path = request.match_info.get("path", "")
         session_data = self.sys_ingress.get_session_data(session)
+        user = await self._get_user(session, session_data) if session_data else None
+        if app.panel_admin and (user is None or not user.is_admin):
+            _LOGGER.warning(
+                "Ingress access to %s denied for non-admin user %s",
+                app.slug,
+                user.id if user else None,
+            )
+            raise HTTPForbidden
         try:
             # Websocket
             if _is_websocket(request):
-                return await self._handle_websocket(request, app, path, session_data)
+                return await self._handle_websocket(request, app, path, user)
 
             # Request
-            return await self._handle_request(request, app, path, session_data)
+            return await self._handle_request(request, app, path, user)
 
         except aiohttp.ClientError as err:
             _LOGGER.error("Ingress error: %s", err)
@@ -170,7 +183,7 @@ class APIIngress(CoreSysAttributes):
         request: web.Request,
         app: App,
         path: str,
-        session_data: IngressSessionData | None,
+        user: HomeAssistantUser | None,
     ) -> web.WebSocketResponse:
         """Ingress route for websocket."""
         if hdrs.SEC_WEBSOCKET_PROTOCOL in request.headers:
@@ -188,10 +201,15 @@ class APIIngress(CoreSysAttributes):
             max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
         )
         await ws_server.prepare(request)
+        request.config_dict[WEBSOCKETS].add(ws_server)
+        # The upgrade may complete after API stop closed the tracked websockets
+        if self.sys_core.state in STOPPING_STATES:
+            await ws_server.close(code=WSCloseCode.GOING_AWAY)
+            return ws_server
 
         # Preparing
         url = self._create_url(app, path)
-        source_header = _init_header(request, app, session_data)
+        source_header = _init_header(request, app, user)
 
         # Support GET query
         if request.query_string:
@@ -207,12 +225,17 @@ class APIIngress(CoreSysAttributes):
                 autoclose=False,
                 autoping=False,
                 max_msg_size=MAX_WEBSOCKET_MESSAGE_SIZE,
+                timeout=ClientWSTimeout(ws_close=WEBSOCKET_CLOSE_TIMEOUT),
             ) as ws_client:
                 # Proxy requests
                 await asyncio.wait(
                     [
-                        self.sys_create_task(_websocket_forward(ws_server, ws_client)),
-                        self.sys_create_task(_websocket_forward(ws_client, ws_server)),
+                        self.sys_create_background_task(
+                            _websocket_forward(ws_server, ws_client)
+                        ),
+                        self.sys_create_background_task(
+                            _websocket_forward(ws_client, ws_server)
+                        ),
                     ],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -226,11 +249,11 @@ class APIIngress(CoreSysAttributes):
         request: web.Request,
         app: App,
         path: str,
-        session_data: IngressSessionData | None,
+        user: HomeAssistantUser | None,
     ) -> web.Response | web.StreamResponse:
         """Ingress route for request."""
         url = self._create_url(app, path)
-        source_header = _init_header(request, app, session_data)
+        source_header = _init_header(request, app, user)
 
         # Passing the raw stream breaks requests for some webservers
         # since we just need it for POST requests really, for all other methods
@@ -290,45 +313,72 @@ class APIIngress(CoreSysAttributes):
             response = web.StreamResponse(status=result.status, headers=headers)
             response.content_type = content_type
 
-            try:
-                response.headers["X-Accel-Buffering"] = "no"
-                await response.prepare(request)
-                async for data, _ in result.content.iter_chunks():
-                    await response.write(data)
+            async with stop_on_disconnect(request):
+                try:
+                    response.headers["X-Accel-Buffering"] = "no"
+                    await response.prepare(request)
+                    async for data, _ in result.content.iter_chunks():
+                        await response.write(data)
 
-            except (
-                aiohttp.ClientError,
-                aiohttp.ClientPayloadError,
-                ConnectionResetError,
-                ConnectionError,
-            ) as err:
-                _LOGGER.error("Stream error with %s: %s", url, err)
+                except (
+                    aiohttp.ClientError,
+                    aiohttp.ClientPayloadError,
+                    ConnectionResetError,
+                    ConnectionError,
+                ) as err:
+                    _LOGGER.error("Stream error with %s: %s", url, err)
 
             return response
 
     async def _find_user_by_id(self, user_id: str) -> HomeAssistantUser | None:
-        """Find user object by the user's ID."""
+        """Find user object by the user's ID.
+
+        Raises HomeAssistantAPIError if the user list cannot be fetched.
+        """
+        users = await self.sys_homeassistant.list_users()
+        return next((user for user in users if user.id == user_id), None)
+
+    async def _get_user(
+        self, session: str, session_data: IngressSessionData
+    ) -> HomeAssistantUser:
+        """Return the user record of a session, resolved from Core once.
+
+        While Core is unreachable the record stored with the session is
+        returned, which denies admin access without caching. Sessions of
+        removed or deactivated users are invalidated.
+        """
+        if user := self.sys_ingress.users.get(session_data.user.id):
+            return user
+
         try:
-            users = await self.sys_homeassistant.list_users()
+            user = await self._find_user_by_id(session_data.user.id)
         except HomeAssistantAPIError as err:
             _LOGGER.warning("Could not fetch list of users: %s", err)
-            return None
+            return session_data.user
 
-        return next((user for user in users if user.id == user_id), None)
+        if user is None or not user.is_active:
+            _LOGGER.warning(
+                "Ingress session of removed or inactive user %s", session_data.user.id
+            )
+            self.sys_ingress.remove_session(session)
+            raise HTTPUnauthorized
+
+        self.sys_ingress.users[user.id] = user
+        return user
 
 
 def _init_header(
-    request: web.Request, app: App, session_data: IngressSessionData | None
+    request: web.Request, app: App, user: HomeAssistantUser | None
 ) -> CIMultiDict[str]:
     """Create initial header."""
     headers = CIMultiDict[str]()
 
-    if session_data is not None:
-        headers[HEADER_REMOTE_USER_ID] = session_data.user.id
-        if session_data.user.username is not None:
-            headers[HEADER_REMOTE_USER_NAME] = session_data.user.username
-        if session_data.user.name is not None:
-            headers[HEADER_REMOTE_USER_DISPLAY_NAME] = session_data.user.name
+    if user is not None:
+        headers[HEADER_REMOTE_USER_ID] = user.id
+        if user.username is not None:
+            headers[HEADER_REMOTE_USER_NAME] = user.username
+        if user.name is not None:
+            headers[HEADER_REMOTE_USER_DISPLAY_NAME] = user.name
 
     # filter flags
     for name, value in request.headers.items():

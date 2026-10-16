@@ -1,15 +1,17 @@
 """Init file for Supervisor util for RESTful API."""
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 import json
 import logging
 from typing import Any, cast
 
 from aiohttp import web
-from aiohttp.hdrs import AUTHORIZATION
+from aiohttp.hdrs import AUTHORIZATION, USER_AGENT
 from aiohttp.web_exceptions import HTTPUnauthorized
 from aiohttp.web_request import Request
+from awesomeversion import AwesomeVersion
 import voluptuous as vol
 from voluptuous.humanize import humanize_error
 
@@ -45,7 +47,7 @@ from ..exceptions import (
     HassioError,
     JobConditionException,
 )
-from ..jobs import JobSchedulerOptions, SupervisorJob
+from ..jobs import JobSchedulerOptions
 from ..jobs.const import JobCondition
 from ..jobs.decorator import Job
 from ..utils import get_message_from_exception_chain
@@ -54,6 +56,8 @@ from ..utils.sentry import async_capture_exception
 from . import const
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+DISCONNECT_CHECK_INTERVAL = 10
 
 # V1 compatibility shim for three AppNotSupported* errors whose legacy
 # addon_* keys are still consumed by the Supervisor client library.
@@ -106,6 +110,23 @@ def extract_supervisor_token(request: web.Request) -> str | None:
         return supervisor_token.split(" ")[-1]
 
     return None
+
+
+def client_library_version(request: web.Request) -> AwesomeVersion | None:
+    """Return the aiohasupervisor version a request was sent with.
+
+    None for any other client, or when the version cannot be compared. A
+    source checkout reports 0.0.0, which is treated as unversioned so a
+    development install sees the full API.
+    """
+    product, _, version = request.headers.get(USER_AGENT, "").partition("/")
+    if product != const.CLIENT_LIBRARY_USER_AGENT:
+        return None
+
+    parsed = AwesomeVersion(version.split(" ", 1)[0])
+    if not parsed.valid or parsed == AwesomeVersion("0.0.0"):
+        return None
+    return parsed
 
 
 def json_loads(data: Any) -> dict[str, Any]:
@@ -356,16 +377,14 @@ async def background_task(
 
     """
     event = asyncio.Event()
-    job, task = cast(
-        tuple[SupervisorJob, asyncio.Task],
-        coresys_obj.sys_jobs.schedule_job(
-            task_method,
-            JobSchedulerOptions(),
-            *args,
-            validation_complete=event,
-            **kwargs,
-        ),
+    job, task = await coresys_obj.sys_jobs.schedule_job(
+        task_method,
+        JobSchedulerOptions(),
+        *args,
+        validation_complete=event,
+        **kwargs,
     )
+    task = cast(asyncio.Task, task)
 
     # Wait for provided event before returning
     # If the task fails validation it should raise before getting there
@@ -379,3 +398,31 @@ async def background_task(
     if event_task in pending:
         event_task.cancel()
     return (task, job.uuid)
+
+
+@asynccontextmanager
+async def stop_on_disconnect(request: web.Request) -> AsyncIterator[None]:
+    """Stop the wrapped streaming block once the client has disconnected.
+
+    aiohttp does not cancel handlers on client disconnect, so a handler waiting
+    on an idle upstream stream would otherwise keep it open indefinitely.
+    """
+    task = asyncio.current_task()
+    assert task
+    disconnected = False
+
+    async def _watch() -> None:
+        nonlocal disconnected
+        while (transport := request.transport) and not transport.is_closing():
+            await asyncio.sleep(DISCONNECT_CHECK_INTERVAL)
+        disconnected = True
+        task.cancel()
+
+    watcher = asyncio.create_task(_watch())
+    try:
+        yield
+    except asyncio.CancelledError:
+        if not disconnected or task.uncancel() > 0:
+            raise
+    finally:
+        watcher.cancel()

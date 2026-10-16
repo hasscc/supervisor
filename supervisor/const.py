@@ -6,10 +6,13 @@ from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
 from sys import version_info as systemversion
-from typing import Any, NotRequired, Self, TypedDict
+from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
 
 from aiohttp import __version__ as aiohttpversion
 from aiohttp.web import RequestKey
+
+if TYPE_CHECKING:
+    from .config import CoreConfig
 
 SUPERVISOR_VERSION = "9999.09.9.dev9999"
 SERVER_SOFTWARE = f"HomeAssistantSupervisor/{SUPERVISOR_VERSION} aiohttp/{aiohttpversion} Python/{systemversion[0]}.{systemversion[1]}"
@@ -126,6 +129,7 @@ ATTR_APPS_REPOSITORIES = "addons_repositories"
 ATTR_ADDR_GEN_MODE = "addr_gen_mode"
 ATTR_ADDRESS = "address"
 ATTR_ADDRESS_DATA = "address-data"
+ATTR_ADDRESSES = "addresses"
 ATTR_ADMIN = "admin"
 ATTR_ADVANCED = "advanced"
 ATTR_APPARMOR = "apparmor"
@@ -322,6 +326,7 @@ ATTR_PRIVILEGED = "privileged"
 ATTR_PROTECTED = "protected"
 ATTR_PROVIDERS = "providers"
 ATTR_PSK = "psk"
+ATTR_PSK_SET = "psk_set"
 ATTR_PWNED = "pwned"
 ATTR_RATING = "rating"
 ATTR_READY = "ready"
@@ -435,10 +440,31 @@ REPOSITORY_CORE = "core"
 REPOSITORY_LOCAL = "local"
 
 FOLDER_HOMEASSISTANT = "homeassistant"
-FOLDER_SHARE = "share"
+# Legacy v1 name, kept for v1 API/backup compatibility. Replaced by Folder.APPS.
 FOLDER_ADDONS = "addons/local"
-FOLDER_SSL = "ssl"
-FOLDER_MEDIA = "media"
+
+
+class Folder(StrEnum):
+    """Backup folder enum."""
+
+    SHARE = "share"
+    APPS = "apps/local"
+    SSL = "ssl"
+    MEDIA = "media"
+
+    def origin_dir(self, config: CoreConfig) -> Path:
+        """Return the on-disk path backing this folder."""
+        match self:
+            case Folder.SHARE:
+                return config.path_share
+            case Folder.APPS:
+                return config.path_apps_local
+            case Folder.SSL:
+                return config.path_ssl
+            case Folder.MEDIA:
+                return config.path_media
+        raise ValueError(f"Unknown folder: {self}")
+
 
 SECURITY_PROFILE = "profile"
 SECURITY_DEFAULT = "default"
@@ -583,6 +609,9 @@ class FeatureFlag(StrEnum):
     SUPERVISOR_WEBSOCKET_V2_API = "supervisor_websocket_v2_api"
 
 
+HOMEASSISTANT_GROUP_ID_ADMIN = "system-admin"
+
+
 @dataclass
 class HomeAssistantUser:
     """A Home Assistant Core user.
@@ -600,6 +629,13 @@ class HomeAssistantUser:
     local_only: bool = False
     system_generated: bool = False
     group_ids: list[str] | None = None
+
+    @property
+    def is_admin(self) -> bool:
+        """Return if the user is an admin, mirroring Core's User.is_admin."""
+        return self.is_owner or (
+            self.is_active and HOMEASSISTANT_GROUP_ID_ADMIN in (self.group_ids or [])
+        )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
@@ -661,6 +697,13 @@ STARTING_STATES = [
     CoreState.STARTUP,
     CoreState.SETUP,
 ]
+
+# Bounds waiting for the peer's close acknowledgment, must stay well below
+# the stage timeouts of Core.stop()
+WEBSOCKET_CLOSE_TIMEOUT = 5
+
+# States in which the Supervisor is shutting down (see Core.stop())
+STOPPING_STATES = frozenset({CoreState.STOPPING, CoreState.CLOSE})
 
 # States in which the API can be used (enforced by system_validation())
 VALID_API_STATES = frozenset(

@@ -3,7 +3,7 @@
 # pylint: disable=W0212
 import asyncio
 from contextlib import suppress
-import datetime
+from datetime import UTC, datetime, timedelta
 import errno
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -15,10 +15,14 @@ from supervisor.const import AppStartup, CoreState
 from supervisor.core import _format_bind_address
 from supervisor.coresys import CoreSys
 from supervisor.dbus.const import DBUS_ERR_SYSTEMD_NO_SUCH_UNIT
+from supervisor.docker.supervisor import DockerSupervisor
 from supervisor.exceptions import (
     AppFileReadError,
     DBusNotConnectedError,
+    DockerError,
     HassioError,
+    JobException,
+    SupervisorUpdateError,
     WhoamiSSLError,
 )
 from supervisor.hardware.helper import HwHelper
@@ -55,7 +59,7 @@ async def test_write_state(run_supervisor_state: MagicMock, coresys: CoreSys):
 
 async def test_adjust_system_datetime(coresys: CoreSys, websession: MagicMock):
     """Test _adjust_system_datetime method with successful retrieve_whoami."""
-    utc_ts = datetime.datetime.now().replace(tzinfo=datetime.UTC)
+    utc_ts = datetime.now().replace(tzinfo=UTC)
     with patch(
         "supervisor.core.retrieve_whoami",
         new_callable=AsyncMock,
@@ -75,7 +79,7 @@ async def test_adjust_system_datetime_without_ssl(
     coresys: CoreSys, websession: MagicMock
 ):
     """Test _adjust_system_datetime method when retrieve_whoami raises WhoamiSSLError."""
-    utc_ts = datetime.datetime.now().replace(tzinfo=datetime.UTC)
+    utc_ts = datetime.now().replace(tzinfo=UTC)
     with patch(
         "supervisor.core.retrieve_whoami",
         new_callable=AsyncMock,
@@ -100,9 +104,7 @@ async def test_adjust_system_datetime_if_time_behind(
     systemd_unit_service.active_state = "active"
     systemd_unit_service.active_state_read.clear()
 
-    utc_ts = datetime.datetime.now().replace(tzinfo=datetime.UTC) + datetime.timedelta(
-        hours=1, minutes=1
-    )
+    utc_ts = datetime.now().replace(tzinfo=UTC) + timedelta(hours=1, minutes=1)
     with (
         patch(
             "supervisor.core.retrieve_whoami",
@@ -905,3 +907,144 @@ async def test_release_core_port_handles_dbus_disconnect_mid_call(
         result = await coresys.core._release_core_port()
 
     assert result is False
+
+
+@pytest.mark.usefixtures("core_start_base_mocks")
+@pytest.mark.parametrize(
+    ("install_side_effect", "startup_continues", "expected_state"),
+    [
+        pytest.param(None, False, CoreState.STARTUP, id="update_succeeds"),
+        pytest.param(DockerError(), True, CoreState.RUNNING, id="update_fails"),
+    ],
+)
+async def test_start_awaits_supervisor_auto_update(
+    coresys: CoreSys,
+    install_side_effect: Exception | None,
+    startup_continues: bool,
+    expected_state: CoreState,
+):
+    """Startup only stops after a successful Supervisor auto update.
+
+    A failed update must not leave the Supervisor stuck in STARTUP without
+    apps, Core or scheduled tasks.
+    """
+    coresys.updater.auto_update = True
+    # pylint: disable-next=protected-access
+    coresys.updater._data.setdefault("image", {})["supervisor"] = (
+        "ghcr.io/home-assistant/amd64-hassio-supervisor"
+    )
+    with (
+        patch.object(Supervisor, "need_update", new=PropertyMock(return_value=True)),
+        patch.object(
+            Supervisor,
+            "latest_version",
+            new=PropertyMock(return_value=AwesomeVersion("2099.1.0")),
+        ),
+        patch.object(Supervisor, "update_apparmor", new=AsyncMock()),
+        patch.object(
+            DockerSupervisor, "install", side_effect=install_side_effect
+        ) as install,
+        patch.object(DockerSupervisor, "update_start_tag", new=AsyncMock()),
+        patch.object(type(coresys.core), "stop", new=AsyncMock()),
+    ):
+        await coresys.core.start()
+
+    install.assert_called_once()
+    assert coresys.apps.boot.called is startup_continues
+    assert coresys.tasks.load.called is startup_continues
+    assert coresys.homeassistant.core.start.called is startup_continues
+    assert coresys.core.state == expected_state
+
+
+@pytest.mark.usefixtures("core_start_base_mocks")
+async def test_start_continues_when_supervisor_update_refused(coresys: CoreSys):
+    """Startup continues when the Supervisor update job is refused."""
+    coresys.updater.auto_update = True
+    with (
+        patch.object(Supervisor, "need_update", new=PropertyMock(return_value=True)),
+        patch.object(Supervisor, "update", return_value=None) as update,
+    ):
+        await coresys.core.start()
+
+    update.assert_awaited_once()
+    coresys.tasks.load.assert_awaited_once()
+    coresys.homeassistant.core.start.assert_awaited_once()
+    assert coresys.core.state == CoreState.RUNNING
+
+
+@pytest.mark.usefixtures("core_start_base_mocks")
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(SupervisorUpdateError(), id="update_error"),
+        pytest.param(JobException(), id="job_error"),
+    ],
+)
+async def test_start_continues_when_supervisor_update_task_fails(
+    coresys: CoreSys, error: HassioError
+):
+    """Startup continues when the detached Supervisor update task fails."""
+
+    async def _failing_update() -> None:
+        raise error
+
+    coresys.updater.auto_update = True
+    with (
+        patch.object(Supervisor, "need_update", new=PropertyMock(return_value=True)),
+        patch.object(
+            Supervisor,
+            "update",
+            new=AsyncMock(return_value=asyncio.create_task(_failing_update())),
+        ),
+    ):
+        await coresys.core.start()
+
+    coresys.tasks.load.assert_awaited_once()
+    coresys.homeassistant.core.start.assert_awaited_once()
+    assert coresys.core.state == CoreState.RUNNING
+
+
+@pytest.mark.usefixtures("core_start_base_mocks")
+@pytest.mark.parametrize(
+    ("finish_healthcheck", "expected_order"),
+    [
+        pytest.param(
+            True,
+            ["healthcheck running", "healthcheck done", "startup complete"],
+            id="finished",
+        ),
+        pytest.param(
+            False, ["healthcheck running", "startup complete"], id="timed_out"
+        ),
+    ],
+)
+async def test_start_completes_after_healthcheck(
+    coresys: CoreSys, finish_healthcheck: bool, expected_order: list[str]
+) -> None:
+    """Test startup complete is sent once the healthcheck finished or timed out."""
+    order: list[str] = []
+    release = asyncio.Event()
+    if finish_healthcheck:
+        release.set()
+
+    async def mock_healthcheck() -> None:
+        order.append(f"healthcheck {coresys.core.state}")
+        await release.wait()
+        order.append("healthcheck done")
+
+    def mock_update_event(key: str, data: dict) -> None:
+        if data == {"startup": "complete"}:
+            order.append("startup complete")
+
+    coresys.homeassistant.websocket.supervisor_update_event.side_effect = (
+        mock_update_event
+    )
+    with (
+        patch.object(coresys.resolution, "healthcheck", new=mock_healthcheck),
+        patch("supervisor.core._STARTUP_HEALTHCHECK_TIMEOUT", 0.01),
+    ):
+        await coresys.core.start()
+        assert order == expected_order
+
+        release.set()
+        await asyncio.sleep(0)

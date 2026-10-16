@@ -1,15 +1,22 @@
 """Init file for Supervisor RESTful API."""
 
+import asyncio
 from dataclasses import dataclass
 from functools import partial
 import logging
 from pathlib import Path
 from typing import Any
+import weakref
 
-from aiohttp import hdrs, web
+from aiohttp import WSCloseCode, hdrs, web
 
 from ..apps.app import App
-from ..const import SUPERVISOR_DOCKER_NAME, AppState, FeatureFlag
+from ..const import (
+    SUPERVISOR_DOCKER_NAME,
+    WEBSOCKET_CLOSE_TIMEOUT,
+    AppState,
+    FeatureFlag,
+)
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import (
     APIAppNotInstalled,
@@ -22,7 +29,7 @@ from .audio import APIAudio
 from .auth import APIAuth
 from .backups import APIBackups
 from .cli import APICli
-from .const import CONTENT_TYPE_TEXT, AppVersion
+from .const import CONTENT_TYPE_TEXT, WEBSOCKETS, AppVersion
 from .discovery import APIDiscovery
 from .dns import APICoreDNS
 from .docker import APIDocker
@@ -106,6 +113,8 @@ class RestAPI(CoreSysAttributes):
 
     async def load(self) -> None:
         """Register REST API Calls."""
+        self.webapp[WEBSOCKETS] = weakref.WeakSet()
+        self.webapp.on_shutdown.append(self._close_websockets)
         v2_enabled = self.sys_config.feature_flags.get(
             FeatureFlag.SUPERVISOR_V2_API, False
         )
@@ -269,6 +278,7 @@ class RestAPI(CoreSysAttributes):
                 web.post("/host/reload", api_host.reload),
                 web.post("/host/options", api_host.options),
                 web.get("/host/services", api_host.services),
+                web.get("/host/disks", api_host.disks),
                 web.get(
                     "/host/disks/{disk}/usage",
                     api_host.disk_usage_v1
@@ -283,27 +293,46 @@ class RestAPI(CoreSysAttributes):
         api_network = APINetwork()
         api_network.coresys = self.coresys
 
-        app.add_routes(
-            [
-                web.get("/network/info", api_network.info),
-                web.post("/network/reload", api_network.reload),
-                web.get(
-                    "/network/interface/{interface}/info", api_network.interface_info
-                ),
-                web.post(
-                    "/network/interface/{interface}/update",
-                    api_network.interface_update,
-                ),
-                web.get(
-                    "/network/interface/{interface}/accesspoints",
-                    api_network.scan_accesspoints,
-                ),
-                web.post(
-                    "/network/interface/{interface}/vlan/{vlan}",
-                    api_network.create_vlan,
-                ),
-            ]
-        )
+        if app is self.versions[AppVersion.V1]:
+            app.add_routes(
+                [
+                    web.get("/network/info", api_network.info_v1),
+                    web.post("/network/reload", api_network.reload),
+                    web.get(
+                        "/network/interface/{interface}/info",
+                        api_network.interface_info_v1,
+                    ),
+                    web.post(
+                        "/network/interface/{interface}/update",
+                        api_network.interface_update,
+                    ),
+                    web.get(
+                        "/network/interface/{interface}/accesspoints",
+                        api_network.scan_accesspoints,
+                    ),
+                    web.post(
+                        "/network/interface/{interface}/vlan/{vlan}",
+                        api_network.create_vlan,
+                    ),
+                ]
+            )
+
+        if app is self.versions[AppVersion.V2]:
+            app.add_routes(
+                [
+                    web.get("/network/info", api_network.info),
+                    web.post("/network/reload", api_network.reload),
+                    web.get("/network/interfaces/{name}", api_network.interface_info),
+                    web.put(
+                        "/network/interfaces/{name}/config",
+                        api_network.update_config,
+                    ),
+                    web.get(
+                        "/network/interfaces/{interface}/accesspoints",
+                        api_network.scan_accesspoints,
+                    ),
+                ]
+            )
 
     def _register_time(self, app: web.Application) -> None:
         """Register time and date functions."""
@@ -434,6 +463,7 @@ class RestAPI(CoreSysAttributes):
             [
                 web.get("/multicast/info", api_multicast.info),
                 web.get("/multicast/stats", stats_handler),
+                web.post("/multicast/options", api_multicast.options),
                 web.post("/multicast/update", api_multicast.update),
                 web.post("/multicast/restart", api_multicast.restart),
             ]
@@ -1148,3 +1178,32 @@ class RestAPI(CoreSysAttributes):
         await self._runner.cleanup()
 
         _LOGGER.info("Stopping API on %s", self.sys_docker.network.supervisor)
+
+    async def _close_websockets(self, app: web.Application) -> None:
+        """Close open proxied websockets on app shutdown.
+
+        aiohttp's graceful shutdown only waits for in-flight handlers, so
+        long-lived websocket proxies would otherwise hold the API stop until
+        the shutdown timeout expires.
+        """
+        # Closed sockets linger in the weak set until garbage collected
+        websockets = [
+            websocket for websocket in app[WEBSOCKETS] if not websocket.closed
+        ]
+        if not websockets:
+            return
+
+        _LOGGER.info("Closing %d websocket connections", len(websockets))
+        try:
+            async with asyncio.timeout(WEBSOCKET_CLOSE_TIMEOUT):
+                await asyncio.gather(
+                    *(
+                        websocket.close(
+                            code=WSCloseCode.GOING_AWAY, message=b"Supervisor stopping"
+                        )
+                        for websocket in websockets
+                    ),
+                    return_exceptions=True,
+                )
+        except TimeoutError:
+            _LOGGER.warning("Timeout closing websocket connections")

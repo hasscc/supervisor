@@ -3,7 +3,6 @@
 import asyncio
 from collections.abc import Awaitable
 from contextlib import suppress
-from dataclasses import replace
 import logging
 from typing import Self, Union
 
@@ -23,6 +22,7 @@ from ..exceptions import (
     AppsJobError,
     CoreDNSError,
     DockerError,
+    HassioArchNotFound,
     HassioError,
 )
 from ..jobs import ChildJobSyncFilter
@@ -155,7 +155,7 @@ class AppManager(CoreSysAttributes):
                     wait_boot.append(start_task)
             except HassioError:
                 self.sys_resolution.add_issue(
-                    replace(app.boot_failed_issue),
+                    app.boot_failed_issue,
                     suggestions=[
                         SuggestionType.EXECUTE_START,
                         SuggestionType.DISABLE_BOOT,
@@ -175,7 +175,7 @@ class AppManager(CoreSysAttributes):
         for app in tasks:
             if app.state in {AppState.ERROR, AppState.UNKNOWN}:
                 self.sys_resolution.add_issue(
-                    replace(app.boot_failed_issue),
+                    app.boot_failed_issue,
                     suggestions=[
                         SuggestionType.EXECUTE_START,
                         SuggestionType.DISABLE_BOOT,
@@ -186,7 +186,10 @@ class AppManager(CoreSysAttributes):
         """Shutdown apps."""
         tasks: list[App] = []
         for app in self.installed:
-            if app.state != AppState.STARTED or app.startup != stage:
+            if (
+                app.state not in (AppState.STARTED, AppState.STARTUP)
+                or app.startup != stage
+            ):
                 continue
             tasks.append(app)
 
@@ -404,10 +407,10 @@ class AppManager(CoreSysAttributes):
 
         for app in needs_repair:
             _LOGGER.info("Repairing for app: %s", app.slug)
-            with suppress(DockerError, KeyError):
+            with suppress(DockerError, KeyError, HassioArchNotFound):
                 # Need pull a image again
                 if not app.need_build:
-                    await app.instance.install(app.version, app.image)
+                    await app.instance.install(app.version, app.image, arch=app.arch)
                     continue
 
                 # Need local lookup
@@ -415,7 +418,9 @@ class AppManager(CoreSysAttributes):
                     store = self.store[app.slug]
                     # If this app is available for rebuild
                     if app.version == store.version:
-                        await app.instance.install(app.version, app.image)
+                        await app.instance.install(
+                            app.version, app.image, arch=app.arch
+                        )
                         continue
 
             _LOGGER.error("Can't repair %s", app.slug)

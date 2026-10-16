@@ -238,6 +238,25 @@ async def test_app_shutdown_error(
     )
 
 
+@pytest.mark.parametrize(
+    ("state", "stopped"),
+    [
+        pytest.param(AppState.STARTED, True, id="started"),
+        pytest.param(AppState.STARTUP, True, id="startup"),
+        pytest.param(AppState.STOPPED, False, id="stopped"),
+    ],
+)
+async def test_app_shutdown_stops_running_apps(
+    coresys: CoreSys, install_app_ssh: App, state: AppState, stopped: bool
+):
+    """Test shutdown stops apps that are running, including those still starting."""
+    force_app_state(install_app_ssh, state)
+    with patch.object(DockerApp, "stop") as stop:
+        await coresys.apps.shutdown(AppStartup.APPLICATION)
+
+    assert stop.called is stopped
+
+
 @pytest.mark.usefixtures("websession")
 async def test_app_uninstall_removes_discovery(coresys: CoreSys, install_app_ssh: App):
     """Test discovery messages removed when app uninstalled."""
@@ -715,3 +734,46 @@ async def test_shared_image_kept_on_update(
         await coresys.apps.update("local_example_image")
         docker.images.delete.assert_called_once_with("image_old", force=True)
         assert install_app_example_image.version == "1.3.0"
+
+
+@pytest.mark.parametrize(
+    "need_build",
+    [
+        pytest.param(False, id="image-based"),
+        pytest.param(True, id="local-build"),
+    ],
+)
+async def test_repair_installs_image_for_app_arch(
+    coresys: CoreSys, install_app_ssh: App, need_build: bool
+) -> None:
+    """Test repair reinstalls a missing image for the app's arch."""
+    with (
+        patch.object(DockerApp, "exists", new=AsyncMock(return_value=False)),
+        patch.object(DockerApp, "install", new=AsyncMock()) as install,
+        patch.object(App, "need_build", new=PropertyMock(return_value=need_build)),
+    ):
+        await coresys.apps.repair()
+
+    install.assert_called_once_with(
+        install_app_ssh.version, install_app_ssh.image, arch=CpuArch.AMD64
+    )
+
+
+async def test_repair_continues_past_unsupported_arch(
+    coresys: CoreSys, install_app_ssh: App, install_app_example: App
+) -> None:
+    """Test repair uninstalls an app without supported arch and repairs the rest."""
+    coresys.apps.data.system[install_app_ssh.slug]["arch"] = ["armv7"]
+
+    with (
+        patch.object(DockerApp, "exists", new=AsyncMock(return_value=False)),
+        patch.object(DockerApp, "install", new=AsyncMock()) as install,
+        patch.object(App, "need_build", new=PropertyMock(return_value=False)),
+        patch.object(type(coresys.apps), "uninstall", new=AsyncMock()) as uninstall,
+    ):
+        await coresys.apps.repair()
+
+    uninstall.assert_called_once_with(install_app_ssh.slug)
+    install.assert_called_once_with(
+        install_app_example.version, install_app_example.image, arch=CpuArch.AMD64
+    )
